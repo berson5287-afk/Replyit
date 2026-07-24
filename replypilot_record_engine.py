@@ -1,0 +1,342 @@
+# replypilot_record_engine.py
+# ReplyPilot Record Engine v1.0.0
+# Stable decision-record store. SQLite primary + JSONL append-only audit log.
+# Keyed on Internet Message-ID (never EntryID). Schema is frozen from v1 —
+# additive changes only, so the training corpus stays usable forever.
+
+ENGINE_VERSION = "1.2.0"
+# v1.2.0: update_ai_draft (AI Review pass rewrites pending drafts in place)
+# v1.1.x (shipped unbumped with app v1.1.0 — noted here for the record):
+#   ACTION_DELETED, purge(), dynamic SQL placeholders in stats/export
+
+import os
+import json
+import sqlite3
+import hashlib
+import threading
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------- storage dir
+
+def data_dir():
+    """%LOCALAPPDATA%\\ReplyPilot on Windows (deliberately not OneDrive-synced,
+    same reasoning as the MaINbox diag bridge files), ~/.replypilot elsewhere."""
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        d = os.path.join(base, "ReplyPilot")
+    else:
+        d = os.path.join(os.path.expanduser("~"), ".replypilot")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+DB_NAME = "replypilot.db"
+AUDIT_NAME = "decisions_audit.jsonl"
+
+# User actions (closed set — do not free-form these)
+ACTION_PENDING = "pending"
+ACTION_ACCEPTED = "accepted"            # AI category + draft accepted as-is
+ACTION_RECATEGORIZED = "recategorized"  # user picked a different category
+ACTION_EDITED = "edited"                # kept category, edited draft text
+ACTION_DECLINED = "declined"            # no reply will be sent
+ACTION_MOVED_NO_REPLY = "moved_no_reply"
+ACTION_UNDO_NO_REPLY = "undo_no_reply"
+ACTION_AUTO_SENT = "auto_sent"          # graduated category, sent without review
+ACTION_DELETED = "deleted"              # v1.1.0: soft-delete; counts as no_reply
+                                        # accepted so the AI learns the pattern
+
+# Actions that count as "AI was right, unchanged" for graduation math
+UNCHANGED_ACTIONS = (ACTION_ACCEPTED, ACTION_AUTO_SENT, ACTION_DELETED)
+# Actions that count as a decided sample at all
+DECIDED_ACTIONS = (ACTION_ACCEPTED, ACTION_RECATEGORIZED, ACTION_EDITED,
+                   ACTION_DECLINED, ACTION_MOVED_NO_REPLY, ACTION_AUTO_SENT,
+                   ACTION_DELETED)
+
+# Graduation thresholds
+GRADUATION_MIN_SAMPLES = 50
+GRADUATION_MIN_AGREEMENT = 0.95
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decisions (
+    message_id     TEXT PRIMARY KEY,
+    received_at    TEXT,
+    subject        TEXT,
+    sender         TEXT,
+    features       TEXT,
+    ai_needs_reply INTEGER,
+    ai_category    TEXT,
+    ai_confidence  REAL,
+    ai_draft       TEXT,
+    ai_source      TEXT,
+    user_action    TEXT NOT NULL DEFAULT 'pending',
+    final_category TEXT,
+    final_draft    TEXT,
+    changed_by_user INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    decided_at     TEXT,
+    body_preview   TEXT,
+    body_full      TEXT
+);
+CREATE TABLE IF NOT EXISTS category_config (
+    category         TEXT PRIMARY KEY,
+    auto_send        INTEGER NOT NULL DEFAULT 0,
+    manual_override  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_action ON decisions(user_action);
+CREATE INDEX IF NOT EXISTS idx_decisions_aicat  ON decisions(ai_category);
+"""
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class RecordStore:
+    """Thread-safe decision store. One instance per app; all methods take
+    their own short-lived cursor under a lock — no long transactions."""
+
+    def __init__(self, directory=None):
+        self.dir = directory or data_dir()
+        self.db_path = os.path.join(self.dir, DB_NAME)
+        self.audit_path = os.path.join(self.dir, AUDIT_NAME)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
+
+    # ------------------------------------------------------------- audit log
+    def _audit(self, event, payload):
+        rec = {"ts": _now(), "event": event}
+        rec.update(payload)
+        # compact JSON, one record per line (lesson learned: never indent an
+        # append-only ops log)
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+        with open(self.audit_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    # ------------------------------------------------------------- ingestion
+    @staticmethod
+    def fallback_message_id(sender, subject, received_at, body):
+        h = hashlib.md5(
+            ("%s|%s|%s|%s" % (sender, subject, received_at, (body or "")[:500]))
+            .encode("utf-8", "replace")).hexdigest()
+        return "<replypilot-synth-%s@local>" % h
+
+    def upsert_intake(self, message_id, received_at, subject, sender,
+                      features, ai_needs_reply, ai_category, ai_confidence,
+                      ai_draft, ai_source, body_full):
+        """Record a newly classified email. Idempotent on message_id —
+        re-scanning the same mail never duplicates or clobbers a decision."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT user_action FROM decisions WHERE message_id=?",
+                (message_id,))
+            row = cur.fetchone()
+            if row is not None:
+                return False  # already known; never overwrite
+            preview = (body_full or "")[:300]
+            self._conn.execute(
+                """INSERT INTO decisions
+                   (message_id, received_at, subject, sender, features,
+                    ai_needs_reply, ai_category, ai_confidence, ai_draft,
+                    ai_source, user_action, created_at, body_preview, body_full)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (message_id, received_at, subject, sender,
+                 json.dumps(features or {}, separators=(",", ":")),
+                 1 if ai_needs_reply else 0, ai_category,
+                 float(ai_confidence or 0.0), ai_draft, ai_source,
+                 ACTION_PENDING, _now(), preview, body_full))
+            self._conn.commit()
+        self._audit("intake", {
+            "message_id": message_id, "ai_category": ai_category,
+            "ai_confidence": ai_confidence, "ai_source": ai_source,
+            "needs_reply": bool(ai_needs_reply), "subject": subject})
+        return True
+
+    # -------------------------------------------------------------- decision
+    def record_decision(self, message_id, user_action, final_category=None,
+                        final_draft=None):
+        assert user_action in DECIDED_ACTIONS + (ACTION_UNDO_NO_REPLY,), \
+            "unknown action %r" % user_action
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT ai_category, ai_draft FROM decisions WHERE message_id=?",
+                (message_id,))
+            row = cur.fetchone()
+            if row is None:
+                return False
+            ai_cat, ai_draft = row["ai_category"], row["ai_draft"]
+            fcat = final_category if final_category is not None else ai_cat
+            fdraft = final_draft if final_draft is not None else ai_draft
+            changed = 1 if (user_action not in UNCHANGED_ACTIONS) else 0
+            self._conn.execute(
+                """UPDATE decisions SET user_action=?, final_category=?,
+                   final_draft=?, changed_by_user=?, decided_at=?
+                   WHERE message_id=?""",
+                (user_action, fcat, fdraft, changed, _now(), message_id))
+            self._conn.commit()
+        self._audit("decision", {
+            "message_id": message_id, "action": user_action,
+            "ai_category": ai_cat, "final_category": fcat,
+            "changed_by_user": bool(changed)})
+        return True
+
+    def reopen(self, message_id, new_ai_category=None, new_ai_draft=None,
+               new_needs_reply=None, ai_source=None):
+        """Undo-from-No-Reply path: put an item back to pending, optionally
+        with a fresh classification."""
+        with self._lock:
+            sets, vals = ["user_action=?", "decided_at=NULL"], [ACTION_PENDING]
+            if new_ai_category is not None:
+                sets.append("ai_category=?"); vals.append(new_ai_category)
+            if new_ai_draft is not None:
+                sets.append("ai_draft=?"); vals.append(new_ai_draft)
+            if new_needs_reply is not None:
+                sets.append("ai_needs_reply=?")
+                vals.append(1 if new_needs_reply else 0)
+            if ai_source is not None:
+                sets.append("ai_source=?"); vals.append(ai_source)
+            vals.append(message_id)
+            self._conn.execute(
+                "UPDATE decisions SET %s WHERE message_id=?" % ",".join(sets),
+                vals)
+            self._conn.commit()
+        self._audit("reopen", {"message_id": message_id})
+        return True
+
+    def update_ai_draft(self, message_id, new_draft, source_note="ai_review"):
+        """v1.2.0: AI Review pass — rewrite the AI draft of a still-pending
+        item. Only touches pending records; a decided record's drafts are
+        part of the training corpus and must never be rewritten."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT user_action, ai_source FROM decisions "
+                "WHERE message_id=?", (message_id,))
+            row = cur.fetchone()
+            if row is None or row["user_action"] != ACTION_PENDING:
+                return False
+            src = row["ai_source"] or ""
+            if source_note and source_note not in src:
+                src = "%s+%s" % (src, source_note) if src else source_note
+            self._conn.execute(
+                "UPDATE decisions SET ai_draft=?, ai_source=? "
+                "WHERE message_id=?", (new_draft, src, message_id))
+            self._conn.commit()
+        self._audit("ai_review_draft", {"message_id": message_id,
+                                        "source": src})
+        return True
+
+    # ---------------------------------------------------------------- queries
+    def pending(self):
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT * FROM decisions WHERE user_action=?
+                   ORDER BY received_at DESC""", (ACTION_PENDING,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def get(self, message_id):
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM decisions WHERE message_id=?", (message_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def by_action(self, action):
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT * FROM decisions WHERE user_action=?
+                   ORDER BY received_at DESC""", (action,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def known_ids(self):
+        with self._lock:
+            cur = self._conn.execute("SELECT message_id FROM decisions")
+            return set(r["message_id"] for r in cur.fetchall())
+
+    # ------------------------------------------------------------ stats/gradu
+    def category_stats(self):
+        """Per AI-assigned category: decided sample count, unchanged count,
+        agreement rate, graduation status."""
+        u_ph = ",".join("?" * len(UNCHANGED_ACTIONS))
+        d_ph = ",".join("?" * len(DECIDED_ACTIONS))
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT ai_category,
+                          COUNT(*) AS n,
+                          SUM(CASE WHEN user_action IN (%s) THEN 1 ELSE 0 END)
+                              AS unchanged
+                   FROM decisions
+                   WHERE user_action IN (%s)
+                   GROUP BY ai_category""" % (u_ph, d_ph),
+                UNCHANGED_ACTIONS + DECIDED_ACTIONS)
+            rows = cur.fetchall()
+            overrides = {r["category"]: dict(r) for r in self._conn.execute(
+                "SELECT * FROM category_config").fetchall()}
+        out = {}
+        for r in rows:
+            cat = r["ai_category"] or "(none)"
+            n = r["n"]
+            unchanged = r["unchanged"] or 0
+            rate = (unchanged / n) if n else 0.0
+            graduated = (n >= GRADUATION_MIN_SAMPLES
+                         and rate >= GRADUATION_MIN_AGREEMENT)
+            ov = overrides.get(cat)
+            auto_send = graduated
+            if ov and ov["manual_override"]:
+                auto_send = bool(ov["auto_send"])
+            out[cat] = {"samples": n, "unchanged": unchanged,
+                        "agreement": round(rate, 4),
+                        "graduated": graduated, "auto_send": auto_send}
+        return out
+
+    def auto_send_enabled(self, category):
+        return self.category_stats().get(category, {}).get("auto_send", False)
+
+    def set_auto_send_override(self, category, enabled):
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO category_config(category, auto_send, manual_override)
+                   VALUES(?,?,1)
+                   ON CONFLICT(category) DO UPDATE
+                   SET auto_send=excluded.auto_send, manual_override=1""",
+                (category, 1 if enabled else 0))
+            self._conn.commit()
+        self._audit("auto_send_override", {"category": category,
+                                           "enabled": bool(enabled)})
+
+    def export_training_jsonl(self, out_path):
+        """Dump every decided record as one JSON object per line — the corpus."""
+        n = 0
+        d_ph = ",".join("?" * len(DECIDED_ACTIONS))
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM decisions WHERE user_action IN (%s)" % d_ph,
+                DECIDED_ACTIONS)
+            rows = [dict(r) for r in cur.fetchall()]
+        with open(out_path, "w", encoding="utf-8") as f:
+            for r in rows:
+                r.pop("body_full", None)  # corpus keeps preview only
+                f.write(json.dumps(r, ensure_ascii=False,
+                                   separators=(",", ":")) + "\n")
+                n += 1
+        return n
+
+    def purge(self, message_ids):
+        """Hard-delete records by message_id list. No undo. Audit logged."""
+        if not message_ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" * len(message_ids))
+            cur = self._conn.execute(
+                "DELETE FROM decisions WHERE message_id IN (%s)"
+                % placeholders, message_ids)
+            n = cur.rowcount
+            self._conn.commit()
+        self._audit("purge", {"message_ids": message_ids, "count": n})
+        return n
+
+    def close(self):
+        with self._lock:
+            self._conn.close()
