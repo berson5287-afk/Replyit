@@ -1,59 +1,229 @@
-# Replyit v1.3.0
+# Replyit
 
-Standalone email auto-reply trainer. Reviews are entirely in-app (zero COM
-while reading/deciding); COM is touched only briefly on worker threads for
-scan and send. Every decision is recorded to build the training corpus that
-justifies graduating categories to auto-send.
+**AI-assisted email reply trainer that learns how you actually respond.**
 
-## Files
-- replypilot.pyw v1.3.0 — Tkinter app (queue tabs, checkboxes, review, AI Review, settings incl. visual toolbar editor, auto-send loop)
-- replypilot_classify_engine.py v1.1.0 — heuristics + Ollama refinement
-- replypilot_draft_engine.py v1.2.0 — per-category templates + LLM polish (off by default)
-- replypilot_mail_engine.py v1.0.0 — .eml parse, Outlook COM scan/send (guarded), .eml draft fallback
-- replypilot_record_engine.py v1.2.0 — SQLite + JSONL audit, graduation math
-- replypilot_auto_engine.py v1.0.0 — auto-send eligibility + delay scheduling (pure logic)
-- selftest_harness.py — 92-check regression harness (run: python selftest_harness.py)
+Replyit classifies inbound mail into a closed set of response types, drafts a
+reply for each, and records every decision you make. As your agreement with a
+category climbs, that category can graduate to sending automatically — but
+only on evidence you generated, never on assumption.
+
+Built for an electrical distributor's RFQ and order workflow. Windows +
+Outlook for live mail; `.eml` import works anywhere.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- `pywin32` for live Outlook scanning/sending (`pip install pywin32`) —
+  optional; `.eml` import and everything else run without it
+- Optional: an [Ollama](https://ollama.com) endpoint for LLM classification
+  and draft polish. Heuristics always produce a full result on their own, so
+  the LLM is a refinement layer, never a dependency.
 
 ## Run
-Double-click replypilot.pyw (or `pythonw replypilot.pyw`). Data lives in
-%LOCALAPPDATA%\ReplyPilot (db, audit jsonl, settings.json, outbox drafts) —
-deliberately not OneDrive-synced.
+
+```
+pythonw replypilot.pyw
+```
+
+Data lives in `%LOCALAPPDATA%\ReplyPilot` (database, audit log, settings,
+outbox drafts) — deliberately outside OneDrive to avoid sync file locks.
+
+## Files
+
+| File | Role |
+|---|---|
+| `replypilot.pyw` | Tkinter app — tabs, review, bulk actions, settings |
+| `replypilot_classify_engine.py` | Heuristics + Ollama refinement, taxonomy |
+| `replypilot_draft_engine.py` | Per-category templates, LLM polish, signatures |
+| `replypilot_mail_engine.py` | `.eml` parsing, Outlook COM scan/send (guarded) |
+| `replypilot_record_engine.py` | SQLite corpus + JSONL audit, graduation math |
+| `replypilot_auto_engine.py` | Auto-send eligibility and delay scheduling |
+| `replypilot_learn_engine.py` | Sent-mail import, staging, confirm/correct |
+| `replyit_diag_bridge.py` | Loopback diagnostic HTTP surface (off by default) |
+| `selftest_harness.py` | Regression harness — `python selftest_harness.py` |
+| `DIAG_BRIDGE.md` | Bridge endpoint reference |
+
+---
 
 ## Workflow
-Import .eml files/folder or Scan Outlook Inbox (needs pywin32). New mail is
-classified into Auto-Reply Queue or No Reply. Double-click to review:
-original body + AI draft. Pick a different response type and the draft
-regenerates. Accept / Accept & Send / Decline / Move to No Reply (undoable
-from the No Reply tab). Everything is recorded with an unchanged/changed flag.
 
-## Taxonomy (closed — do not add free-form categories)
-quote_ack, no_quote, need_info, job_name, acknowledgement, escalate, no_reply
+Import `.eml` files, or scan selected Outlook folders. New mail is classified
+and lands in one of several tabs:
 
-## Graduation
-Per AI-category: >= 50 decided samples AND >= 95% unchanged (accepted or
-auto_sent) => graduated. Stats window shows it; double-click a row to toggle
-a manual auto-send override. v1.2.0: auto-send now EXECUTES when the Settings master switch is on
-AND a category is graduated/overridden AND confidence >= threshold. Every
-send waits the delay window; opening or deleting the email cancels it;
-eligibility is re-verified at fire time. Escalate and No-Reply are never
-auto-sent regardless of settings or overrides.
+- **Auto-Reply Queue** — needs a reply, ready to review
+- **Needs Your Input** — asks something only you know ("who's the
+  competition?"). Never auto-sends, whatever its category
+- **AI Review Queue** — staged for LLM draft tailoring
+- **No Reply / Deleted / Decided**
 
-## LLM
-Ollama on tillium-bridge (100.89.98.118:11434, gemma3:27b). Overrides:
-REPLYPILOT_OLLAMA_HOST / _PORT / _MODEL / _TIMEOUT. REPLYPILOT_NO_LLM=1
-forces heuristics-only. Heuristics always produce a full result; the LLM is
-a refinement layer, never a dependency. Draft LLM polish is OFF by default
-(settings.json: use_llm_polish).
+Double-click any row to see the original alongside the draft. Pick a
+different response type and the draft regenerates. Accept, Accept & Send,
+Decline, or Move to No Reply — individually, or in bulk from the toolbar.
 
-## Keys & threading
-Internet Message-ID is the only key (fallback = md5 of sender|subject|date|body
-for mail without one). EntryID is never used. Outlook send finds the original
-via DASL filter on PR_INTERNET_MESSAGE_ID. All COM follows
-outlook_thread_init/uninit/fresh_outlook on worker threads.
+Every decision is recorded with an unchanged/changed flag. That record is the
+product; the automation is downstream of it.
 
-## Test status (honest disclosure)
-Compile + harness verified on Linux/Python 3.12: eml parsing, all heuristic
-paths, drafts, record store, idempotent re-intake, undo, graduation math,
-override, export, audit format, .eml draft fallback, COM guards. NOT live
-tested: Outlook COM scan/send (Windows-only), Ollama calls, Tkinter UI
-(headless container). Exercise those on your machine before trusting them.
+## Taxonomy
+
+Closed set — do not add free-form categories, because graduation counts are
+per category and a category that means several things cannot graduate
+honestly.
+
+| Category | Meaning |
+|---|---|
+| `quote_ack` | New RFQ received — will follow up with pricing |
+| `quote_in_process` | Sender is chasing an RFQ already in hand |
+| `quote_delivered` | Replying with the actual price/availability now |
+| `no_quote` | Declining to quote |
+| `purchase_order` | An inbound order to acknowledge, not an enquiry |
+| `transactional` | Proof of delivery, invoice, ASN, packing slip |
+| `need_info` | Can't proceed without more detail from them |
+| `job_name` | Need the job name to register/price |
+| `acknowledgement` | They delivered what was asked for — brief thanks |
+| `escalate` | Complaint, legal, or unusual — a human must handle it |
+| `no_reply` | Automated mail or a bare thanks |
+
+Separately, a `needs_input` **flag** marks any email whose answer requires a
+fact only you hold. It is a flag rather than a category because it is
+orthogonal — a genuine `quote_ack` can still need a job name before it can be
+sent — and because the property that matters, *never auto-send*, applies
+whatever the category turns out to be.
+
+## Graduation and auto-send
+
+A category graduates at **≥50 decided samples and ≥95% unchanged**. The Stats
+window shows the numbers; double-click a row to force a manual override.
+
+Auto-send fires only when every gate passes:
+
+1. Master switch on in Settings (off by default)
+2. Category graduated, or manually overridden
+3. Category is not `escalate` or `no_reply` — hard-excluded regardless
+4. Row is not flagged `needs_input` — hard-excluded regardless
+5. Confidence ≥ the configured threshold
+6. A non-empty draft exists
+7. Still pending at both schedule time **and** fire time
+
+Every send then waits a delay window. Opening or deleting the email cancels
+it, and eligibility is re-checked at the moment of firing.
+
+## Learn from Sent
+
+Imports a sent-mail JSON export and turns real replies into training data —
+but only with explicit confirmation.
+
+Genuine replies are kept (`in_reply_to`, or an `RE:`/`FW:` subject), the typed
+reply is split from signature and quoted original, the inbound email is
+recovered from the quoted headers, and a response type is inferred and staged.
+
+**Staged rows are inert.** They live in a separate table that the graduation
+math never reads, so an AI guess sitting in staging cannot push anything
+toward auto-send. Only Confirm (accepted) or Correct (recategorized) promotes
+a row into the corpus; ignored and untouched rows affect nothing. Promoted
+records carry `origin='import'` so they stay distinguishable from live
+decisions permanently.
+
+Inference reads the **reply** first rather than the inbound email: the label
+needed is which response was chosen, and the reply is that response. Measured
+against a real export, inbound-first collapsed 8 of 9 records to `quote_ack`
+while the replies were declines, job-name asks and delivered prices;
+reply-first got 8 of 9 right.
+
+## LLM configuration
+
+Host-first with automatic local fallback. Classification and draft polish try
+the configured host first, then a local Ollama if the host is down **or** busy
+and timing out. Everything is editable in **Settings → AI Settings**, with a
+Test connection button and a **Load installed models** button that reads each
+endpoint's `/api/tags` and warns when a configured model isn't actually
+installed.
+
+Classification pins `temperature: 0`. Ollama defaults to 0.8, which means the
+same email could come back with a different category run to run — and an
+unstable label cannot be learned from, because the agreement rate would be
+measuring sampling noise as much as judgement. Draft polish keeps its
+variation, where it is harmless.
+
+Environment overrides: `REPLYPILOT_OLLAMA_HOST` / `_PORT` / `_MODEL` /
+`_TIMEOUT` for the host, `REPLYPILOT_LOCAL_HOST` / `_LOCAL_PORT` /
+`_LOCAL_MODEL` for the fallback, `REPLYPILOT_HOST_PROBE` for the reachability
+probe, and `REPLYPILOT_NO_LLM=1` to force heuristics only. Saved settings
+override the environment defaults.
+
+## Signatures
+
+On send, Outlook's own signature is preserved. `Item.Reply()` already contains
+your configured signature with logos and images; the draft is prepended inside
+`HTMLBody` rather than assigning `.Body`, which would collapse that HTML
+document to plain text and lose them. The plain-text signature in Settings is
+stripped from the draft first so it isn't duplicated, and remains the fallback
+when Outlook isn't available.
+
+## Keys and threading
+
+Internet Message-ID is the only message key — EntryID churns under Cached
+Exchange Mode. Folder selections are stored by Outlook `FolderPath` for the
+same reason. Outlook send locates the original via a DASL filter on
+`PR_INTERNET_MESSAGE_ID`.
+
+All COM runs on worker threads under
+`outlook_thread_init` / `outlook_thread_uninit` / `fresh_outlook`. The review
+loop itself touches no COM at all.
+
+## Diagnostics
+
+`replyit_diag_bridge.py` exposes a loopback HTTP surface for inspecting a
+running instance. Off unless `REPLYIT_DIAG=1`; binds `127.0.0.1` only; fresh
+token per boot. No endpoint touches Outlook COM. See `DIAG_BRIDGE.md`.
+
+`POST /classify` is the useful one for accuracy work: it runs the real
+classifier and writes nothing, so a batch can be scored against expected
+categories without the test polluting the corpus it is measuring.
+
+---
+
+## Privacy
+
+**Real mail never belongs in this repository.** Sent-mail exports contain live
+customer and vendor addresses, job names and pricing. `.gitignore` excludes
+`*sent_samples*.json`, `*.eml`, `*.msg`, exported corpora and the runtime
+database. Check `git status` before every commit.
+
+The learning-engine tests run against a private sent-mail fixture. Without it
+they are skipped, not failed — that is expected on a clone, and the rest of
+the suite still runs.
+
+## Test status — honest disclosure
+
+Compile- and harness-verified on Linux/Python 3.12: `.eml` parsing, every
+heuristic path, drafts, the record store, idempotent re-intake, undo,
+graduation math, overrides, export, audit format, COM guards against a stubbed
+folder tree, the learning pipeline against a real export, auto-send gating,
+and the diagnostic bridge over real HTTP.
+
+**Not live-tested:** Outlook COM scan and send (Windows-only), the HTMLBody
+signature path, live Ollama calls, and the Tkinter UI itself. Auto-send has
+never fired against real mail. Exercise those on your own machine — and send
+one test reply to yourself — before trusting them.
+
+## Changelog
+
+| Version | Change |
+|---|---|
+| 1.14.0 | Diagnostic bridge for external inspection |
+| 1.13.0 | Deterministic classification; `purchase_order` and `transactional`; Reclassify Pending |
+| 1.12.x | `needs_input` flag + tab; AI Review Queue with cancel; one row, one tab |
+| 1.11.0 | `quote_in_process`; quote dropdown; Enter/Escape hotkeys |
+| 1.10.0 | Bulk actions with keep-AI-choice default |
+| 1.9.x | Multi-mailbox folder selection, grouped and filtered |
+| 1.8.0 | Outlook signature preserved on send; model discovery |
+| 1.7.0 | Per-window geometry; toolbar editor; signature import |
+| 1.6.x | Learn from Sent with inert staging; retuned on real data |
+| 1.5.0 | AI Settings; window geometry |
+| 1.4.0 | Host-first Ollama with local fallback |
+| 1.3.0 | Manifest toolbar; select all/none; AI Review made usable |
+| 1.2.0 | `acknowledgement`; AI Review; auto-send engine |
+| 1.1.0 | Theme, multi-select, Deleted bucket |
+| 1.0.0 | Initial release |

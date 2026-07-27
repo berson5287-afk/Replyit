@@ -9,7 +9,9 @@
 #   - CoInitialize / CoUninitialize bracketed per thread (thread_init/uninit)
 #   - fresh Dispatch per worker session
 
-ENGINE_VERSION = "1.0.0"
+ENGINE_VERSION = "1.3.0"  # v1.3.0: system-folder marking
+                          # v1.2.0: multi-folder enumeration + scanning
+                          # v1.1.0: HTMLBody send preserves Outlook signature+images
 
 import os
 import re
@@ -181,58 +183,259 @@ def _item_message_id(item):
         return ""
 
 
-def scan_outlook_inbox(max_items=100, unread_only=False):
-    """Worker-thread only. Returns list of MailItem from the default Inbox,
-    newest first. Brief walk, no body mutation, read-only."""
+OL_FOLDER_INBOX = 6      # olFolderInbox
+OL_ITEM_MAIL = 0         # olMailItem
+
+# Outlook creates a lot of internal plumbing that shows up as mail folders.
+# None of it ever holds mail a person would triage, and on a real profile it
+# buries the handful of folders that matter. Marked at enumeration so the UI
+# can hide it while the data stays available.
+SYSTEM_FOLDER_NAMES = {
+    "yammer root", "webextaddins", "outlook customer manager",
+    "sync issues", "conflicts", "local failures", "server failures",
+    "social activity notifications", "quick step settings",
+    "conversation action settings", "conversation history", "team chat",
+    "eventcheckpoints", "files", "rss feeds", "rss subscriptions",
+    "personmetadata", "recipient cache", "external contacts",
+    "organizational contacts", "gal contacts", "companies",
+    "suggested contacts", "sharing", "reminders", "clean up folder",
+    "large mail", "todo search", "to-do search", "the file so far",
+    "imapmail", "yammer", "quarantine", "purposeful", "sms",
+    "calendar", "contacts", "tasks", "notes", "journal",
+}
+_GUID_NAME_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-", )
+
+
+def is_system_folder_name(name):
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    return n in SYSTEM_FOLDER_NAMES or bool(_GUID_NAME_RE.match(n))
+
+
+def list_mail_folders(max_depth=3, with_counts=True):
+    """Worker-thread only. Enumerate mail folders across every store the
+    profile has open — the user's own mailbox, shared mailboxes, archives.
+
+    Returns [{path, name, store, depth, count}]. `path` is Outlook's
+    FolderPath ("\\\\sales@example.com\\Inbox") and is what gets saved: it is
+    human-readable and stable across restarts, unlike EntryID, which churns
+    under Cached Exchange Mode.
+    """
     outlook_thread_init()
     try:
         app = fresh_outlook()
         ns = app.GetNamespace("MAPI")
-        inbox = ns.GetDefaultFolder(6)  # olFolderInbox
-        items = inbox.Items
-        items.Sort("[ReceivedTime]", True)
-        if unread_only:
-            items = items.Restrict("[Unread] = True")
-        out, count = [], 0
-        for item in items:
-            if count >= max_items:
-                break
+        out = []
+
+        def walk(folders, depth, store_name, parent_system):
+            if depth > max_depth:
+                return
             try:
-                if getattr(item, "Class", None) != 43:  # olMail
-                    continue
-                mid = _item_message_id(item)
-                rt = item.ReceivedTime
-                received = datetime(rt.year, rt.month, rt.day, rt.hour,
-                                    rt.minute, rt.second,
-                                    tzinfo=timezone.utc)\
-                    .isoformat(timespec="seconds")
-                sender_addr = ""
+                count = folders.Count
+            except Exception:
+                return
+            for i in range(1, count + 1):
                 try:
-                    sender_addr = item.SenderEmailAddress or ""
-                    if item.SenderEmailAddress and \
-                       item.SenderEmailAddress.startswith("/"):
-                        # Exchange DN — try SMTP via sender object
-                        exu = item.Sender.GetExchangeUser()
-                        if exu is not None:
-                            sender_addr = exu.PrimarySmtpAddress or sender_addr
+                    f = folders.Item(i)
                 except Exception:
-                    pass
-                out.append(MailItem(
-                    message_id=mid,
-                    subject=item.Subject or "",
-                    sender=sender_addr,
-                    sender_name=item.SenderName or "",
-                    received_at=received,
-                    body=(item.Body or "").strip(),
-                    source="outlook",
-                    source_path="",
-                ))
-                count += 1
+                    continue
+                try:
+                    is_mail = (f.DefaultItemType == OL_ITEM_MAIL)
+                except Exception:
+                    is_mail = True   # assume mail if the type isn't exposed
+                try:
+                    path = f.FolderPath
+                    name = f.Name
+                except Exception:
+                    continue
+                # a system folder taints its whole subtree — Yammer Root's
+                # Inbound/Outbound/Feeds children are plumbing too
+                sys_flag = parent_system or is_system_folder_name(name)
+                if is_mail:
+                    n = -1
+                    if with_counts:
+                        try:
+                            n = f.Items.Count
+                        except Exception:
+                            n = -1
+                    out.append({"path": path, "name": name,
+                                "store": store_name or name,
+                                "depth": depth, "count": n,
+                                "system": bool(sys_flag)})
+                try:
+                    walk(f.Folders, depth + 1, store_name or name, sys_flag)
+                except Exception:
+                    continue
+
+        try:
+            roots = ns.Folders
+            root_count = roots.Count
+        except Exception:
+            return out
+        for i in range(1, root_count + 1):
+            try:
+                root = roots.Item(i)
+                store_name = root.Name
+            except Exception:
+                continue
+            try:
+                walk(root.Folders, 0, store_name, False)
             except Exception:
                 continue
         return out
     finally:
         outlook_thread_uninit()
+
+
+def default_inbox_path():
+    """Worker-thread only. FolderPath of the default Inbox, or ''."""
+    outlook_thread_init()
+    try:
+        app = fresh_outlook()
+        ns = app.GetNamespace("MAPI")
+        return ns.GetDefaultFolder(OL_FOLDER_INBOX).FolderPath
+    except Exception:
+        return ""
+    finally:
+        outlook_thread_uninit()
+
+
+def _resolve_folder(ns, path):
+    """Find a folder by its FolderPath. Returns the folder or None."""
+    target = (path or "").strip()
+    if not target:
+        return None
+    found = []
+
+    def walk(folders, depth):
+        if found or depth > 6:
+            return
+        try:
+            count = folders.Count
+        except Exception:
+            return
+        for i in range(1, count + 1):
+            if found:
+                return
+            try:
+                f = folders.Item(i)
+                fp = f.FolderPath
+            except Exception:
+                continue
+            if fp == target:
+                found.append(f)
+                return
+            # only descend when the target sits below this node
+            if target.startswith(fp):
+                try:
+                    walk(f.Folders, depth + 1)
+                except Exception:
+                    continue
+
+    try:
+        roots = ns.Folders
+        for i in range(1, roots.Count + 1):
+            if found:
+                break
+            try:
+                root = roots.Item(i)
+            except Exception:
+                continue
+            if root.FolderPath == target:
+                found.append(root)
+                break
+            walk(root.Folders, 0)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def _items_from_folder(folder, max_items, unread_only, source_label):
+    """Read MailItems out of an open folder. Assumes COM is initialized."""
+    out = []
+    try:
+        items = folder.Items
+        items.Sort("[ReceivedTime]", True)
+        if unread_only:
+            items = items.Restrict("[Unread] = True")
+    except Exception:
+        return out
+    count = 0
+    for item in items:
+        if count >= max_items:
+            break
+        try:
+            if getattr(item, "Class", None) != 43:  # olMail
+                continue
+            mid = _item_message_id(item)
+            rt = item.ReceivedTime
+            received = datetime(rt.year, rt.month, rt.day, rt.hour,
+                                rt.minute, rt.second,
+                                tzinfo=timezone.utc).isoformat(
+                                    timespec="seconds")
+            sender_addr = ""
+            try:
+                sender_addr = item.SenderEmailAddress or ""
+                if sender_addr.startswith("/"):
+                    exu = item.Sender.GetExchangeUser()
+                    if exu is not None:
+                        sender_addr = exu.PrimarySmtpAddress or sender_addr
+            except Exception:
+                pass
+            out.append(MailItem(
+                message_id=mid,
+                subject=item.Subject or "",
+                sender=sender_addr,
+                sender_name=item.SenderName or "",
+                received_at=received,
+                body=(item.Body or "").strip(),
+                source="outlook",
+                source_path=source_label,
+            ))
+            count += 1
+        except Exception:
+            continue
+    return out
+
+
+def scan_outlook_folders(paths=None, max_items=100, unread_only=False):
+    """Worker-thread only. Scan the given FolderPaths (default Inbox when
+    none are given). max_items applies PER FOLDER so one busy mailbox can't
+    starve the others. Returns (items, per_folder_report)."""
+    outlook_thread_init()
+    try:
+        app = fresh_outlook()
+        ns = app.GetNamespace("MAPI")
+        targets = []
+        if paths:
+            for p in paths:
+                f = _resolve_folder(ns, p)
+                targets.append((p, f))
+        else:
+            try:
+                f = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+                targets.append((f.FolderPath, f))
+            except Exception:
+                targets.append(("(default inbox)", None))
+        all_items, report = [], []
+        for label, folder in targets:
+            if folder is None:
+                report.append((label, 0, "not found"))
+                continue
+            got = _items_from_folder(folder, max_items, unread_only, label)
+            all_items.extend(got)
+            report.append((label, len(got), "ok"))
+        return all_items, report
+    finally:
+        outlook_thread_uninit()
+
+
+def scan_outlook_inbox(max_items=100, unread_only=False):
+    """Back-compat wrapper: default Inbox only, items list only."""
+    items, _report = scan_outlook_folders(None, max_items, unread_only)
+    return items
 
 
 def find_outlook_item_by_message_id(ns, message_id):
@@ -250,9 +453,30 @@ def find_outlook_item_by_message_id(ns, message_id):
     return None
 
 
-def send_outlook_reply(message_id, body):
+def _text_to_html(text):
+    """Minimal, safe HTML for a plain-text draft. Deliberately unstyled so it
+    inherits the font of the surrounding Outlook message."""
+    import html as _html
+    esc = _html.escape(text or "")
+    paras = [p for p in esc.split("\n\n")]
+    body = "".join("<p>%s</p>" % p.replace("\n", "<br>\n") for p in paras)
+    return "<div>%s</div>" % body
+
+
+def send_outlook_reply(message_id, body, use_outlook_signature=True):
     """Worker-thread only. Finds the original by Message-ID, creates a Reply,
-    sets the body above the quoted original, sends. Returns (ok, detail)."""
+    puts the draft above everything Outlook already prepared, sends.
+
+    v1.1.0: writes HTMLBody rather than Body when keeping Outlook's
+    signature. Item.Reply() already contains the user's configured reply
+    signature — images, logos, formatting and all — plus the quoted
+    original. Assigning .Body collapses that whole document to plain text
+    and the signature's images are lost. Prepending to .HTMLBody keeps it
+    intact, which is why the sent mail looks like the rest of the user's
+    mail without Replyit having to reconstruct a signature at all.
+
+    Returns (ok, detail).
+    """
     outlook_thread_init()
     try:
         app = fresh_outlook()
@@ -261,7 +485,32 @@ def send_outlook_reply(message_id, body):
         if item is None:
             return False, "original not found by Message-ID"
         reply = item.Reply()
-        reply.Body = body + "\n\n" + (reply.Body or "")
+        if use_outlook_signature:
+            existing = ""
+            try:
+                existing = reply.HTMLBody or ""
+            except Exception:
+                existing = ""
+            if existing:
+                html_draft = _text_to_html(body)
+                # insert just inside <body> when present so the document
+                # structure (and any signature styling) is preserved
+                lowered = existing.lower()
+                idx = lowered.find("<body")
+                if idx != -1:
+                    end = lowered.find(">", idx)
+                    if end != -1:
+                        reply.HTMLBody = (existing[:end + 1] + html_draft
+                                          + existing[end + 1:])
+                    else:
+                        reply.HTMLBody = html_draft + existing
+                else:
+                    reply.HTMLBody = html_draft + existing
+            else:
+                # no HTML available (plain-text account) — fall back
+                reply.Body = body + "\n\n" + (reply.Body or "")
+        else:
+            reply.Body = body + "\n\n" + (reply.Body or "")
         reply.Send()
         return True, "sent"
     except Exception as e:

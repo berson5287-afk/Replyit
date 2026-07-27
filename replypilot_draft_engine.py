@@ -5,7 +5,15 @@
 # a dependency. Settings (signature, company name) live in settings.json in
 # the ReplyPilot data dir and are created with defaults on first run.
 
-ENGINE_VERSION = "1.2.0"  # v1.2.0: polish_draft with reasons, output
+ENGINE_VERSION = "1.8.0"  # v1.8.0: purchase_order + transactional templates
+                          # v1.7.0: quote_in_process template
+                          # v1.6.0: strip_configured_signature
+                          # v1.5.0: Outlook signature discovery/import
+                          # v1.4.0: quote_delivered template
+                          # v1.3.0: polish routes through shared host-first
+                          # /local-fallback caller; ollama_reachable checks
+                          # both endpoints
+                          # v1.2.0: polish_draft with reasons, output
                           # repair pipeline, ollama_reachable preflight
                           # v1.1.0: acknowledgement template, save_settings,
                           # auto-send settings defaults
@@ -17,8 +25,11 @@ import urllib.request
 
 from replypilot_classify_engine import (
     CAT_QUOTE_ACK, CAT_NO_QUOTE, CAT_NEED_INFO, CAT_JOB_NAME,
-    CAT_ESCALATE, CAT_ACK, CAT_NO_REPLY, OLLAMA_HOST, OLLAMA_PORT,
+    CAT_ESCALATE, CAT_ACK, CAT_QUOTE_DELIVERED, CAT_QUOTE_IN_PROCESS,
+    CAT_PURCHASE_ORDER, CAT_TRANSACTIONAL, CAT_NO_REPLY,
+    OLLAMA_HOST, OLLAMA_PORT,
     OLLAMA_MODEL, OLLAMA_TIMEOUT, NO_LLM,
+    ollama_call, any_endpoint_reachable, active_endpoint_label,
 )
 
 SETTINGS_NAME = "settings.json"
@@ -32,6 +43,8 @@ DEFAULT_SETTINGS = {
     "auto_send_master": False,
     "auto_send_delay_sec": 60,
     "auto_send_min_conf": 0.85,
+    # v1.6.0: let Outlook attach the real signature (with images) on send
+    "use_outlook_signature": True,
 }
 
 
@@ -110,6 +123,27 @@ TEMPLATES = {
         "properly, so I'm looking into it personally and will follow up "
         "with you today.\n\n{sig}"
     ),
+    CAT_PURCHASE_ORDER: (
+        "Hi {greet}\n\n"
+        "Thank you for the order — received. I'll confirm pricing and "
+        "delivery and get an acknowledgement over to you shortly.\n\n{sig}"
+    ),
+    CAT_TRANSACTIONAL: (
+        "Hi {greet}\n\n"
+        "Received, thank you — I'll get this to the right person here.\n\n"
+        "{sig}"
+    ),
+    CAT_QUOTE_IN_PROCESS: (
+        "Hi {greet}\n\n"
+        "Yes — this is being worked on and I'll get it over to you shortly. "
+        "Thank you for your patience!\n\n{sig}"
+    ),
+    CAT_QUOTE_DELIVERED: (
+        "Hi {greet}\n\n"
+        "Thanks for the request. Pricing and availability below — let me "
+        "know if you'd like me to put this together as a formal quote.\n\n"
+        "[ add pricing here ]\n\n{sig}"
+    ),
     CAT_ACK: (
         "Hi {greet}\n\n"
         "Thank you — received. Appreciate the quick turnaround. I'll review "
@@ -117,6 +151,79 @@ TEMPLATES = {
     ),
     CAT_NO_REPLY: "",
 }
+
+
+def outlook_signature_dir():
+    """%APPDATA%\\Microsoft\\Signatures — where Outlook stores signatures.
+    No COM required; they are ordinary files on disk."""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return ""
+    d = os.path.join(appdata, "Microsoft", "Signatures")
+    return d if os.path.isdir(d) else ""
+
+
+def list_outlook_signatures():
+    """Return [(name, path)] for each signature that has a plain-text form.
+
+    The .txt companion is preferred: Replyit sends plain-text replies, and
+    Outlook writes a .txt alongside every .htm signature, so using it avoids
+    dragging HTML markup into a draft.
+    """
+    d = outlook_signature_dir()
+    if not d:
+        return []
+    out = []
+    try:
+        for fn in sorted(os.listdir(d)):
+            base, ext = os.path.splitext(fn)
+            if ext.lower() == ".txt":
+                out.append((base, os.path.join(d, fn)))
+    except OSError:
+        return []
+    return out
+
+
+def read_signature_file(path, max_chars=2000):
+    """Read a signature file, tolerating the encodings Outlook writes."""
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                text = f.read(max_chars + 1)
+            if "\x00" in text:
+                continue
+            text = text.replace("\r\n", "\n").strip()
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text[:max_chars]
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except OSError:
+            return ""
+    return ""
+
+
+def strip_configured_signature(text, signature):
+    """Remove the app's own text signature from a draft.
+
+    Used when Outlook is adding the real signature on send: without this the
+    reply would carry both the plain-text block and Outlook's HTML one.
+    """
+    if not text or not signature:
+        return (text or "").strip()
+    sig = signature.strip()
+    if not sig:
+        return text.strip()
+    idx = text.rfind(sig)
+    if idx != -1:
+        return text[:idx].rstrip()
+    # signature edited since the draft was written — fall back to its first
+    # line (typically the sender's name), matched from the end
+    first = sig.splitlines()[0].strip()
+    if first:
+        idx = text.rfind(first)
+        if idx != -1:
+            return text[:idx].rstrip()
+    return text.strip()
 
 
 def render_template(category, sender_name="", sender_addr="", settings=None):
@@ -151,16 +258,10 @@ def polish_with_llm(template_text, original_subject, original_body,
 
 
 def ollama_reachable(timeout=3):
-    """v1.2.0: fast preflight so the AI Review pass can fail loudly and
-    immediately instead of silently eating a 30s timeout per email."""
-    try:
-        req = urllib.request.Request(
-            "http://%s:%d/api/tags" % (OLLAMA_HOST, OLLAMA_PORT))
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            r.read(200)
-        return True
-    except Exception:
-        return False
+    """v1.3.0: True if EITHER the host or the local fallback answers. AI
+    Review only hard-fails when both are down; if just tillium is down it
+    proceeds on local."""
+    return any_endpoint_reachable(timeout=timeout)
 
 
 _PREAMBLE_RE = re.compile(
@@ -202,9 +303,10 @@ def _clean_polish_output(text, template_text, signature):
 
 def polish_draft(template_text, original_subject, original_body,
                  settings=None, timeout=None):
-    """v1.2.0: the real polish entry point. Returns (text_or_None, reason)
-    where reason is 'ok', 'no_llm', 'empty_template', 'llm_error', or a
-    cleaner rejection ('empty'/'too_short'/'too_long')."""
+    """v1.3.0: real polish entry point. Routes through the shared host-first
+    /local-fallback caller (ollama_call). Returns (text_or_None, reason)
+    where reason is 'ok', 'no_llm', 'empty_template', 'no_endpoint' (both
+    host and local down), 'error:<Type>', or a cleaner rejection."""
     if NO_LLM:
         return None, "no_llm"
     if not template_text:
@@ -212,20 +314,12 @@ def polish_draft(template_text, original_subject, original_body,
     prompt = ("CUSTOMER EMAIL:\nSubject: %s\n%s\n\nTEMPLATE REPLY:\n%s"
               % (original_subject or "", (original_body or "")[:2000],
                  template_text))
-    url = "http://%s:%d/api/chat" % (OLLAMA_HOST, OLLAMA_PORT)
-    payload = json.dumps({
-        "model": OLLAMA_MODEL, "stream": False,
-        "messages": [{"role": "system", "content": _POLISH_SYSTEM},
-                     {"role": "user", "content": prompt}],
-    }).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout or OLLAMA_TIMEOUT) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        raw = ((data.get("message") or {}).get("content") or "")
-    except Exception as e:
-        return None, "llm_error:%s" % e.__class__.__name__
+    raw, label = ollama_call(
+        [{"role": "system", "content": _POLISH_SYSTEM},
+         {"role": "user", "content": prompt}],
+        timeout=timeout, deterministic=False)
+    if raw is None:
+        return None, label   # 'no_endpoint' or 'error:<Type>'
     sig = (settings or {}).get("signature") or DEFAULT_SETTINGS["signature"]
     return _clean_polish_output(raw, template_text, sig)
 

@@ -1,0 +1,33 @@
+# --- real mail data: NEVER commit -------------------------------------------
+# Sent-mail exports and anything derived from them contain live customer and
+# vendor addresses, job names and pricing. Keep them local.
+fixture_sent_samples.json
+*sent_samples*.json
+*_export.json
+*corpus*.jsonl
+*.eml
+*.msg
+
+# --- runtime data -----------------------------------------------------------
+# The app writes to %LOCALAPPDATA%\ReplyPilot, but guard against a stray copy
+replypilot.db
+decisions_audit.jsonl
+settings.json
+diag_token.json
+outbox/
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+~$*
