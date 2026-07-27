@@ -4,7 +4,12 @@
 # Keyed on Internet Message-ID (never EntryID). Schema is frozen from v1 —
 # additive changes only, so the training corpus stays usable forever.
 
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "1.5.0"
+# v1.5.0: reclassify_pending (re-run classification without touching corpus)
+# v1.4.0: needs_input column (+ migration) and set_needs_input
+# v1.3.0: origin column (+ migration) and import_decided_record, so records
+#         promoted from the learning importer are distinguishable from live
+#         decisions in the corpus forever
 # v1.2.0: update_ai_draft (AI Review pass rewrites pending drafts in place)
 # v1.1.x (shipped unbumped with app v1.1.0 — noted here for the record):
 #   ACTION_DELETED, purge(), dynamic SQL placeholders in stats/export
@@ -75,7 +80,9 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at     TEXT NOT NULL,
     decided_at     TEXT,
     body_preview   TEXT,
-    body_full      TEXT
+    body_full      TEXT,
+    origin         TEXT NOT NULL DEFAULT 'live',
+    needs_input    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS category_config (
     category         TEXT PRIMARY KEY,
@@ -104,7 +111,24 @@ class RecordStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
             self._conn.commit()
+
+    def _migrate_locked(self):
+        """v1.3.0: additive migrations for databases created by earlier
+        versions. CREATE TABLE IF NOT EXISTS won't add columns to a table
+        that already exists, so new columns are applied here. Additive only
+        — the corpus schema is never rewritten or dropped."""
+        cur = self._conn.execute("PRAGMA table_info(decisions)")
+        have = {r["name"] for r in cur.fetchall()}
+        if "origin" not in have:
+            self._conn.execute(
+                "ALTER TABLE decisions ADD COLUMN origin TEXT "
+                "NOT NULL DEFAULT 'live'")
+        if "needs_input" not in have:
+            self._conn.execute(
+                "ALTER TABLE decisions ADD COLUMN needs_input INTEGER "
+                "NOT NULL DEFAULT 0")
 
     # ------------------------------------------------------------- audit log
     def _audit(self, event, payload):
@@ -126,7 +150,7 @@ class RecordStore:
 
     def upsert_intake(self, message_id, received_at, subject, sender,
                       features, ai_needs_reply, ai_category, ai_confidence,
-                      ai_draft, ai_source, body_full):
+                      ai_draft, ai_source, body_full, needs_input=False):
         """Record a newly classified email. Idempotent on message_id —
         re-scanning the same mail never duplicates or clobbers a decision."""
         with self._lock:
@@ -141,13 +165,15 @@ class RecordStore:
                 """INSERT INTO decisions
                    (message_id, received_at, subject, sender, features,
                     ai_needs_reply, ai_category, ai_confidence, ai_draft,
-                    ai_source, user_action, created_at, body_preview, body_full)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ai_source, user_action, created_at, body_preview,
+                    body_full, needs_input)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (message_id, received_at, subject, sender,
                  json.dumps(features or {}, separators=(",", ":")),
                  1 if ai_needs_reply else 0, ai_category,
                  float(ai_confidence or 0.0), ai_draft, ai_source,
-                 ACTION_PENDING, _now(), preview, body_full))
+                 ACTION_PENDING, _now(), preview, body_full,
+                 1 if needs_input else 0))
             self._conn.commit()
         self._audit("intake", {
             "message_id": message_id, "ai_category": ai_category,
@@ -204,6 +230,98 @@ class RecordStore:
                 vals)
             self._conn.commit()
         self._audit("reopen", {"message_id": message_id})
+        return True
+
+    def import_decided_record(self, message_id, received_at, subject, sender,
+                              features, ai_category, ai_confidence, ai_draft,
+                              ai_source, final_category, final_draft,
+                              corrected, body_full=""):
+        """v1.3.0: insert an already-decided record from the learning
+        importer. Written with origin='import' so imported samples stay
+        distinguishable from live decisions in the corpus forever.
+
+        A confirmed inference lands as ACCEPTED (counts as unchanged); a
+        corrected one lands as RECATEGORIZED (counts as changed) — the same
+        arithmetic the live path uses, so graduation stats stay honest."""
+        action = ACTION_RECATEGORIZED if corrected else ACTION_ACCEPTED
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM decisions WHERE message_id=?", (message_id,))
+            if cur.fetchone() is not None:
+                return False
+            self._conn.execute(
+                """INSERT INTO decisions
+                   (message_id, received_at, subject, sender, features,
+                    ai_needs_reply, ai_category, ai_confidence, ai_draft,
+                    ai_source, user_action, final_category, final_draft,
+                    changed_by_user, created_at, decided_at, body_preview,
+                    body_full, origin)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (message_id, received_at, subject, sender,
+                 json.dumps(features or {}, separators=(",", ":")),
+                 1, ai_category, float(ai_confidence or 0.0), ai_draft,
+                 ai_source, action, final_category, final_draft,
+                 1 if corrected else 0, _now(), _now(),
+                 (body_full or "")[:300], body_full, "import"))
+            self._conn.commit()
+        self._audit("import_decision", {
+            "message_id": message_id, "action": action,
+            "ai_category": ai_category, "final_category": final_category,
+            "corrected": bool(corrected), "origin": "import"})
+        return True
+
+    def origin_counts(self):
+        """v1.3.0: how much of the decided corpus is live vs imported."""
+        d_ph = ",".join("?" * len(DECIDED_ACTIONS))
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT origin, COUNT(*) n FROM decisions "
+                "WHERE user_action IN (%s) GROUP BY origin" % d_ph,
+                DECIDED_ACTIONS)
+            return {r["origin"]: r["n"] for r in cur.fetchall()}
+
+    def reclassify_pending(self, message_id, category, confidence, draft,
+                           source, needs_reply=True, needs_input=None):
+        """v1.5.0: rewrite the AI verdict on a still-pending row.
+
+        Only pending rows are touched. A decided row's verdict is part of the
+        training corpus — rewriting it would retroactively change what the
+        user was agreeing or disagreeing with, and silently corrupt every
+        agreement rate computed from it."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT user_action FROM decisions WHERE message_id=?",
+                (message_id,))
+            row = cur.fetchone()
+            if row is None or row["user_action"] != ACTION_PENDING:
+                return False
+            sets = ["ai_category=?", "ai_confidence=?", "ai_draft=?",
+                    "ai_source=?", "ai_needs_reply=?"]
+            vals = [category, float(confidence or 0.0), draft, source,
+                    1 if needs_reply else 0]
+            if needs_input is not None:
+                sets.append("needs_input=?")
+                vals.append(1 if needs_input else 0)
+            vals.append(message_id)
+            self._conn.execute(
+                "UPDATE decisions SET %s WHERE message_id=?" % ",".join(sets),
+                vals)
+            self._conn.commit()
+        self._audit("reclassify", {"message_id": message_id,
+                                   "category": category,
+                                   "source": source})
+        return True
+
+    def set_needs_input(self, message_id, flag):
+        """v1.4.0: mark/unmark an email as requiring the user's own
+        knowledge. Auto-send treats this as a hard block."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE decisions SET needs_input=? WHERE message_id=?",
+                (1 if flag else 0, message_id))
+            self._conn.commit()
+        self._audit("needs_input", {"message_id": message_id,
+                                    "flag": bool(flag)})
         return True
 
     def update_ai_draft(self, message_id, new_draft, source_note="ai_review"):
@@ -289,6 +407,15 @@ class RecordStore:
             out[cat] = {"samples": n, "unchanged": unchanged,
                         "agreement": round(rate, 4),
                         "graduated": graduated, "auto_send": auto_send}
+        # v1.4.0: a category can carry a manual override before it has any
+        # decided rows at all. Building `out` only from the GROUP BY meant
+        # such an override was silently ignored — the setting looked applied
+        # and did nothing.
+        for cat, ov in overrides.items():
+            if cat in out or not ov["manual_override"]:
+                continue
+            out[cat] = {"samples": 0, "unchanged": 0, "agreement": 0.0,
+                        "graduated": False, "auto_send": bool(ov["auto_send"])}
         return out
 
     def auto_send_enabled(self, category):

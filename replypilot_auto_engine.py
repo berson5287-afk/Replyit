@@ -13,10 +13,13 @@
 #   4. Confidence >= auto_send_min_conf (settings)
 #   5. Draft is non-empty
 #   6. Item is still pending at both schedule time AND fire time
+#   7. Item is not flagged needs_input — a reply that depends on a fact only
+#      the user holds is never safe to send automatically, whatever its
+#      category's agreement rate happens to be
 # Every send then waits auto_send_delay_sec — the undo window. Opening the
 # item's review or deleting it cancels the scheduled send.
 
-ENGINE_VERSION = "1.0.0"
+ENGINE_VERSION = "1.1.0"  # v1.1.0: needs_input is a hard auto-send block
 
 import time
 
@@ -69,6 +72,10 @@ class AutoSendEngine:
             if (r.get("ai_confidence") or 0.0) < min_conf:
                 continue
             if not (r.get("ai_draft") or "").strip():
+                continue
+            if r.get("needs_input"):
+                # v1.1.0: the reply depends on a fact only the user holds,
+                # so no category graduation can make this safe to send
                 continue
             out.append(r)
         return out
