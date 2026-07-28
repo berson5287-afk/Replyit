@@ -1033,7 +1033,8 @@ class ReplyPilotApp:
                 draft, _src = drafts.make_draft(
                     cat, row.get("sender", "").split("@")[0],
                     row.get("sender", ""), row.get("subject", ""),
-                    row.get("body_full") or "", self.settings)
+                    row.get("body_full") or "", self.settings,
+                    voice_examples=self._voice_for(cat))
             else:
                 draft = row.get("ai_draft") or ""
             self.auto.cancel(mid)
@@ -1207,7 +1208,8 @@ class ReplyPilotApp:
                             it.get("sender", ""),
                             it.get("subject", ""),
                             it.get("body", ""),
-                            self.settings)
+                            self.settings,
+                            voice_examples=self._voice_for(res["category"]))
                     inserted = self.store.upsert_intake(
                         mid, it.get("received_at", ""),
                         it.get("subject", ""), it.get("sender", ""),
@@ -1330,6 +1332,20 @@ class ReplyPilotApp:
     def _set_status(self, msg):
         self.status_var.set(msg)
 
+    def _voice_for(self, category):
+        """The user's own confirmed replies for a category, as style examples.
+
+        Only promoted rows qualify (phrasing_examples enforces that), so an
+        unconfirmed import guess can never shape a draft. Failures are
+        swallowed deliberately: drafting must keep working on the template
+        alone if the learning store is unavailable, which is exactly what
+        happened for every draft before this was wired up.
+        """
+        try:
+            return self.learn.phrasing_examples(category, limit=5)
+        except Exception:
+            return []
+
     # ----------------------------------------------------------------- review
     def _open_review(self, tree, from_no_reply=False,
                      from_deleted=False, read_only=False):
@@ -1394,7 +1410,8 @@ class ReplyPilotApp:
                             res["category"],
                             row.get("sender", "").split("@")[0],
                             row.get("sender", ""), row.get("subject", ""),
-                            row.get("body_full") or "", settings)
+                            row.get("body_full") or "", settings,
+                            voice_examples=self._voice_for(res["category"]))
                     else:
                         dsrc = "template"
                     ok = self.store.reclassify_pending(
@@ -2631,7 +2648,8 @@ class ReviewWindow:
             cat, name, self.row.get("sender", ""),
             self.row.get("subject", ""),
             self.row.get("body_full") or "",
-            self.app.settings)
+            self.app.settings,
+            voice_examples=self.app._voice_for(cat))
         self.draft_txt.delete("1.0", "end")
         self.draft_txt.insert("1.0", text)
 
@@ -2690,7 +2708,8 @@ class ReviewWindow:
             self.row.get("sender", ""),
             self.row.get("subject", ""),
             self.row.get("body_full") or "",
-            self.app.settings)
+            self.app.settings,
+            voice_examples=self.app._voice_for(clf.CAT_QUOTE_ACK))
         self.app.store.reopen(
             self.row["message_id"],
             new_ai_category=clf.CAT_QUOTE_ACK,
