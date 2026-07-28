@@ -7,7 +7,11 @@
 # Closed taxonomy — categories are FIXED. This is what makes the learning
 # loop measurable. Do not add free-form categories.
 
-ENGINE_VERSION = "1.9.0"  # v1.9.0: purchase_order + transactional categories
+ENGINE_VERSION = "1.10.0"  # v1.10.0: heuristic/LLM arbitration + calibrated
+                          # confidence; bulk-mail and ticketing detection;
+                          # attachment-priced deliveries; signals passed to
+                          # the LLM
+                          # v1.9.0: purchase_order + transactional categories
                           # v1.8.0: deterministic classification (temp 0)
                           # v1.7.0: needs_input flag (orthogonal to category)
                           # v1.6.0: quote_in_process (chase detection)
@@ -621,6 +625,56 @@ def detect_needs_input(subject, body):
     return bool(_NEEDS_INPUT_RE.search(text))
 
 
+# --------------------------------------------------- v1.10.0: arbitration
+# What a confidence is FOR in this app: gate 4 of the auto-send engine
+# compares it against auto_send_min_conf (0.85 by default). So a confidence is
+# not a display detail — it is the number that decides whether a reply leaves
+# the building without a human seeing it. That makes "where did this number
+# come from" a safety question.
+#
+# Previously the LLM's answer replaced the heuristic outright whenever it
+# parsed, carrying the model's self-reported confidence straight to that gate.
+# Two things were wrong with it. The number is not calibrated — 43 of 67 live
+# rows sat at 0.90 or 1.00 — and the override was unconditional, so an answer
+# the model itself scored 0.00 displaced a heuristic holding 0.75.
+#
+# The two classifiers are genuinely independent: one is regex over an
+# electrical distributor's vocabulary, the other a general model reading the
+# prose. Agreement between them is real corroboration and is worth more than
+# either alone. Disagreement is the honest signal that this email is hard —
+# and a hard email is exactly the one a human should see, so a contested
+# result is capped below any sane auto-send threshold rather than being
+# resolved by fiat.
+AGREE_BONUS = 0.05           # corroborated by both -> modest boost
+AGREE_MAX = 0.95             # never claim certainty; 1.00 is not earned here
+CONTESTED_MAX = 0.50         # classifiers disagree -> a human decides
+LLM_SOLO_MAX = 0.80          # LLM over a bare heuristic fall-through
+LLM_UNSTATED_CONFIDENCE = 0.5
+
+# Heuristic fall-through verdicts — reached by exhausting every rule rather
+# than by matching one, so they carry no evidence to contest the LLM with.
+_HEURISTIC_FALLBACKS = frozenset((CAT_ESCALATE, CAT_NEED_INFO, CAT_NO_REPLY))
+
+
+def arbitrate(h_cat, h_conf, llm):
+    """Combine the heuristic and LLM verdicts into (category, confidence,
+    source). Pure and side-effect free so it can be tested directly."""
+    if llm is None:
+        return h_cat, h_conf, "heuristic"
+    _l_needs, l_cat, l_conf = llm
+    if l_cat == h_cat:
+        return (l_cat, min(AGREE_MAX, max(h_conf, l_conf) + AGREE_BONUS),
+                "agree")
+    # They disagree. The LLM reads intent better than regex does on this
+    # corpus, so it still picks the category — but when the heuristic reached
+    # its verdict by matching an actual rule (rather than falling off the end
+    # of the chain) that disagreement is informative, and the row is capped
+    # into human review.
+    if h_conf >= 0.5 and h_cat not in _HEURISTIC_FALLBACKS:
+        return l_cat, min(CONTESTED_MAX, l_conf), "llm-contested"
+    return l_cat, min(LLM_SOLO_MAX, l_conf), "llm"
+
+
 def classify(subject, sender, body):
     """Public entry point.
     Returns dict: needs_reply, category, confidence, features, source."""
@@ -633,11 +687,17 @@ def classify(subject, sender, body):
                 "confidence": h_conf, "features": feats,
                 "source": "heuristic", "needs_input": False}
 
-    llm = classify_llm(subject, sender, body)
-    if llm is not None:
-        needs, cat, conf = llm
-        return {"needs_reply": needs, "category": cat, "confidence": conf,
-                "features": feats, "source": "llm", "needs_input": ni}
-
-    return {"needs_reply": h_needs, "category": h_cat, "confidence": h_conf,
-            "features": feats, "source": "heuristic", "needs_input": ni}
+    llm = classify_llm(subject, sender, body, feats)
+    cat, conf, source = arbitrate(h_cat, h_conf, llm[:3] if llm else None)
+    if llm:
+        # Record WHICH endpoint answered, because the fallback is otherwise
+        # invisible and the two endpoints are not interchangeable. On this
+        # install the host lists gemma3:27b in /api/tags — so the reachability
+        # probe passes — while every actual chat call 500s on a CUDA fault,
+        # and each classification quietly lands on a 3B local model instead.
+        # A stored label is only as trustworthy as the model that produced it,
+        # so the corpus should say which one that was.
+        source = "%s:%s" % (source, llm[3])
+    return {"needs_reply": cat != CAT_NO_REPLY, "category": cat,
+            "confidence": conf, "features": feats,
+            "source": source, "needs_input": ni}
