@@ -1523,13 +1523,23 @@ class ReplyPilotApp:
             if not ids:
                 return
             n = 0
+            undet = 0
             for sid in ids:
-                ok, _ = self.learn.confirm(sid)
+                ok, why = self.learn.confirm(sid)
                 if ok:
                     n += 1
+                elif why == "undetermined":
+                    undet += 1
             refresh()
-            self._set_status("Confirmed %d imported sample(s) into the "
-                             "corpus." % n)
+            msg = "Confirmed %d imported sample(s) into the corpus." % n
+            if undet:
+                # These were never classified — the importer returned escalate
+                # because it could not tell. Confirming would record agreement
+                # with a verdict that was never reached, so Correct is the only
+                # way in.
+                msg += ("  %d skipped: no category was inferred — use Correct "
+                        "to assign one." % undet)
+            self._set_status(msg)
 
         def correct_sel():
             ids = selected_ids()

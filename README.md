@@ -125,6 +125,18 @@ a row into the corpus; ignored and untouched rows affect nothing. Promoted
 records carry `origin='import'` so they stay distinguishable from live
 decisions permanently.
 
+**Rows the importer could not read cannot be Confirmed.** Inference returns
+`escalate` as its "could not tell" answer in four places — an internal
+colleague thread, an outbound follow-up, an empty reply, and the final
+fall-through — because such a row needs a human. It is never returned as a
+positive verdict; no rule here concludes "this is an escalation". Confirm
+promotes the *inferred* category, so agreeing with one of those recorded a
+full-strength training sample asserting something nobody ever concluded. In
+the live corpus 9 of 10 `escalate` samples arrived this way, giving the
+category a perfect 10/10 agreement rate built almost entirely on shrugs.
+Confirm now refuses them; Correct still admits them, because naming a
+category is the judgement the sentinel was standing in for.
+
 Inference reads the **reply** first rather than the inbound email: the label
 needed is which response was chosen, and the reply is that response. Measured
 against a real export, inbound-first collapsed 8 of 9 records to `quote_ack`

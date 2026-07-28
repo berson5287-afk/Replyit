@@ -52,6 +52,32 @@ STATUS_IGNORED = "ignored"      # user explicitly dismissed it
 INERT_STATUSES = (STATUS_STAGED, STATUS_IGNORED)
 TRAINING_STATUSES = (STATUS_CONFIRMED, STATUS_CORRECTED)
 
+# ------------------------------------------------------- undetermined rows
+# Inference here returns escalate as its "I could not tell" answer, in four
+# separate places: an internal colleague thread, an outbound follow-up, an
+# empty reply, and the final fall-through of infer_from_reply_text. It is
+# never returned as a positive verdict — no rule in this module concludes
+# "this is an escalation". escalate was chosen because the row needs a human,
+# and routing it to the escalate bucket achieves that.
+#
+# The cost only appears one step later. Confirm promotes the *inferred*
+# category into the corpus, so confirming such a row records "the classifier
+# said escalate and the user agreed" — a full-strength training sample
+# asserting something nobody ever concluded. In the live corpus 9 of the 10
+# escalate samples arrived this way, giving escalate a perfect 10/10
+# agreement rate built almost entirely on shrugs.
+#
+# So a bare Confirm is refused on these; they can still be promoted, but only
+# by naming a category explicitly, which is the judgement the sentinel was
+# standing in for.
+UNDETERMINED_MAX_CONFIDENCE = 0.4
+
+
+def is_undetermined(ai_category, ai_confidence):
+    """True when a staged label means 'could not tell' rather than a verdict."""
+    return (ai_category == clf.CAT_ESCALATE
+            and (ai_confidence or 0.0) < UNDETERMINED_MAX_CONFIDENCE)
+
 # ------------------------------------------------------------------- parsing
 # Quoted-original header block, Outlook plain-text style. Kept tolerant of
 # leading whitespace and ">" quote markers.
@@ -308,21 +334,31 @@ def normalize_quotes(text):
 # what Replyit learns — Replyit responds to inbound mail. Real example from
 # the export: "Sorry forgot an item please add below." is an addendum to the
 # user's own P&A request, not a response to a customer.
-_R_OUTBOUND_RE = re.compile(
-    r"(please provide me with price and avail|provide me with p\s*&\s*a|"
-    r"please (quote|add|price) (the |below|these)|forgot an item|"
-    r"please add below|add (this|these) to (my|the) (rfq|request))", re.I)
+# NOTE: _R_OUTBOUND_RE is defined once, below, next to the other reply-text
+# patterns it belongs with. An earlier duplicate definition used to sit here
+# and was silently overridden by that one — editing this copy changed nothing,
+# which is a slow way to learn that it was dead.
+
+
+def _unwrapped(text):
+    """Normalized and with line wrapping folded to single spaces.
+
+    Outlook hard-wraps sent mail, so a phrase the patterns look for arrives
+    split across a newline — "let me know how many they are still\nshowing in
+    stock" does not match a pattern written as one line. Folding first makes
+    phrase matching independent of where the wrap happened to land, which is
+    never information worth being sensitive to.
+    """
+    return " ".join(normalize_quotes(text or "").split())
 
 
 def looks_outbound_followup(candidate):
     """True if this reply continues the user's own outbound request."""
-    t = normalize_quotes(candidate.get("reply_text", ""))
-    if _R_OUTBOUND_RE.search(t):
+    if _R_OUTBOUND_RE.search(_unwrapped(candidate.get("reply_text", ""))):
         return True
     # no recoverable inbound sender + outbound phrasing in the quoted thread
     if not candidate.get("orig_from_email"):
-        if _R_OUTBOUND_RE.search(normalize_quotes(
-                candidate.get("orig_body", ""))):
+        if _R_OUTBOUND_RE.search(_unwrapped(candidate.get("orig_body", ""))):
             return True
     return False
 
@@ -438,7 +474,19 @@ _R_OUTBOUND_RE = re.compile(
     # asking a vendor about their stock / for their pricing
     r"if so,? please quote|do you have stock on|do you have any stock|"
     r"is this all in stock|are these in stock|do you (have|carry|stock) "
-    r"(this|these|any)|can you supply|are you able to supply)", re.I)
+    r"(this|these|any)|can you supply|are you able to supply|"
+    # v1.7.0: the "please quote" clause above needs an article after the verb,
+    # so the phrasing actually used all day — "PLEASE QUOTE A PRICE AND THE
+    # AVAILABILITY OF THIS BOM" — walked straight past it. Six near-identical
+    # copies sat in a 100-mail import waiting to be promoted as need_info
+    # exemplars; the phrasing library would then have taught the app to answer
+    # a customer's RFQ by asking them to quote it. \w* on the noun absorbs the
+    # typos these are dashed off with (PICE, AVAILABILTY).
+    r"please quote (a |the )?p\w*|"
+    r"please quote\b[^.\n]{0,25}avail\w*|"
+    r"(can you )?let me know how many[^.\n]{0,30}in stock|"
+    r"how many (they )?(are )?(still )?showing in stock|"
+    r"is (that|this) stock(ed)? in\b)", re.I)
 
 _R_NOQUOTE_RE = re.compile(
     r"(we don'?t (sell|stock|carry)|we do not (sell|stock|carry)|"
@@ -654,6 +702,11 @@ class LearningStore:
         if row is None or row["status"] in TRAINING_STATUSES:
             return False, None
         inferred = row["ai_category"]
+        if final_category is None and is_undetermined(inferred,
+                                                      row["ai_confidence"]):
+            # Nothing was ever concluded about this row; agreeing with it
+            # would manufacture a training sample out of a shrug.
+            return False, "undetermined"
         final = final_category or inferred
         corrected = (final != inferred)
         status = STATUS_CORRECTED if corrected else STATUS_CONFIRMED
