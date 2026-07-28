@@ -21,6 +21,7 @@ ENGINE_VERSION = "1.8.0"  # v1.8.0: purchase_order + transactional templates
 import os
 import re
 import json
+import datetime
 import urllib.request
 
 from replypilot_classify_engine import (
@@ -85,69 +86,80 @@ def _first_name(sender_name, sender_addr):
         if not re.search(r"[@\d]", token):
             return token
     if sender_addr and "@" in sender_addr:
-        local = sender_addr.split("@")[0]
-        local = re.split(r"[._-]", local)[0]
+        whole = sender_addr.split("@")[0].lower()
+        local = re.split(r"[._-]", whole)[0]
+        if whole in _ROLE_LOCALPART or local in _ROLE_LOCALPART:
+            return ""       # a role address has no first name to use
         if local and local.isalpha():
             return local.capitalize()
     return ""
 
 
+# v1.10.0: templates written in the user's measured voice.
+#
+# These were house style, not his, and the gap was not a matter of taste — it
+# is measurable. Across 71 real replies from his sent mail:
+#
+#   length     median 14 words, ONE sentence; 82% under 30 words
+#   opener     59% none at all; "Good morning/afternoon <Name>," 33%;
+#              "Hi <Name>," — which every template used — 1%
+#   sign-off   63% none; "Thanks!" 28%
+#
+# The old templates ran 25-40 words over two or three clauses and opened with
+# the one greeting he essentially never uses. They also matter more than the
+# LLM path does: a template is what ships whenever polish is off, the endpoint
+# is down, or the voice safety check rejects a draft, so this is the voice the
+# app falls back to and therefore the one it needs to get right.
+#
+# His own recurring phrasing is used where he has it — "Will advise",
+# "this is being worked on", "Attached is your quote", "What job is this for"
+# — while each category keeps exactly the commitment it made before.
 TEMPLATES = {
     CAT_QUOTE_ACK: (
-        "Hi {greet}\n\n"
-        "Thanks for the RFQ — received. I'll get back to you with pricing "
-        "and availability on this shortly.\n\n{sig}"
+        "{greet}\n\n"
+        "Will advise. Thanks!\n\n{sig}"
     ),
     CAT_NO_QUOTE: (
-        "Hi {greet}\n\n"
-        "Thanks for reaching out. Unfortunately we won't be able to quote "
-        "this one, but I appreciate you thinking of us — please keep us in "
-        "mind for the next one.\n\n{sig}"
+        "{greet}\n\n"
+        "Sorry, we can't quote this one. Thanks!\n\n{sig}"
     ),
     CAT_NEED_INFO: (
-        "Hi {greet}\n\n"
-        "Thanks for the request. Before I can price this out I need a little "
-        "more information — part numbers (or manufacturer and description) "
-        "and quantities. Once I have that I'll turn the quote around "
-        "quickly.\n\n{sig}"
+        "{greet}\n\n"
+        "Can you send me part numbers and quantities? I'll get it priced "
+        "up. Thanks!\n\n{sig}"
     ),
     CAT_JOB_NAME: (
-        "Hi {greet}\n\n"
-        "Thanks for the RFQ. Can you send me the job name so I can register "
-        "it and get you the best possible pricing? I'll get moving on it as "
-        "soon as I have that.\n\n{sig}"
+        "{greet}\n\n"
+        "What job is this for? Thanks!\n\n{sig}"
     ),
     CAT_ESCALATE: (
-        "Hi {greet}\n\n"
-        "Thanks for your email — I want to make sure this gets handled "
-        "properly, so I'm looking into it personally and will follow up "
-        "with you today.\n\n{sig}"
+        "{greet}\n\n"
+        "Sorry about that — I'm looking into it and will get back to you "
+        "today.\n\n{sig}"
     ),
     CAT_PURCHASE_ORDER: (
-        "Hi {greet}\n\n"
-        "Thank you for the order — received. I'll confirm pricing and "
-        "delivery and get an acknowledgement over to you shortly.\n\n{sig}"
+        "{greet}\n\n"
+        "Got the order — I'll confirm pricing and delivery shortly. "
+        "Thanks!\n\n{sig}"
     ),
     CAT_TRANSACTIONAL: (
-        "Hi {greet}\n\n"
-        "Received, thank you — I'll get this to the right person here.\n\n"
-        "{sig}"
+        "{greet}\n\n"
+        "Received, thank you — I'll get this to the right person.\n\n{sig}"
     ),
     CAT_QUOTE_IN_PROCESS: (
-        "Hi {greet}\n\n"
-        "Yes — this is being worked on and I'll get it over to you shortly. "
-        "Thank you for your patience!\n\n{sig}"
+        "{greet}\n\n"
+        "This is being worked on and I should have it over to you shortly. "
+        "Thanks!\n\n{sig}"
     ),
     CAT_QUOTE_DELIVERED: (
-        "Hi {greet}\n\n"
-        "Thanks for the request. Pricing and availability below — let me "
-        "know if you'd like me to put this together as a formal quote.\n\n"
-        "[ add pricing here ]\n\n{sig}"
+        "{greet}\n\n"
+        "Attached is your quote.\n\n"
+        "[ add pricing / lead time ]\n\n"
+        "Thanks!\n\n{sig}"
     ),
     CAT_ACK: (
-        "Hi {greet}\n\n"
-        "Thank you — received. Appreciate the quick turnaround. I'll review "
-        "and follow up if I have any questions.\n\n{sig}"
+        "{greet}\n\n"
+        "Thank you! Appreciate it.\n\n{sig}"
     ),
     CAT_NO_REPLY: "",
 }
@@ -226,15 +238,36 @@ def strip_configured_signature(text, signature):
     return text.strip()
 
 
-def render_template(category, sender_name="", sender_addr="", settings=None):
+def greeting_for(sender_name="", sender_addr="", now=None):
+    """The user's own opener: time-of-day, name attached when known.
+
+    Measured over his sent mail, his explicit greetings are "Good morning
+    <Name>," and "Good afternoon <Name>," in almost equal number and together
+    a third of all replies; "Hi <Name>," — which every template used — appears
+    once in 71. The remaining 59% open with no greeting at all, but a template
+    is a starting point the user edits, and dropping the greeting entirely
+    reads as brusque on a draft he has not looked at yet.
+
+    Note the comma placement: he writes "Good morning Dave," with the comma
+    after the name, and "Good morning," when there is no name.
+    """
+    first = _first_name(sender_name, sender_addr)
+    hour = (now or datetime.datetime.now()).hour
+    part = ("Good morning" if hour < 12
+            else "Good afternoon" if hour < 17
+            else "Good evening")
+    return "%s %s," % (part, first) if first else "%s," % part
+
+
+def render_template(category, sender_name="", sender_addr="", settings=None,
+                    now=None):
     settings = settings or dict(DEFAULT_SETTINGS)
     tpl = TEMPLATES.get(category, "")
     if not tpl:
         return ""
-    first = _first_name(sender_name, sender_addr)
-    greet = ("%s," % first) if first else "there,"
-    return tpl.format(greet=greet, sig=settings.get(
-        "signature", DEFAULT_SETTINGS["signature"]))
+    return tpl.format(greet=greeting_for(sender_name, sender_addr, now),
+                      sig=settings.get("signature",
+                                       DEFAULT_SETTINGS["signature"]))
 
 
 # ------------------------------------------------------------------ LLM polish
@@ -247,6 +280,88 @@ _POLISH_SYSTEM = (
     "in the template. Plain text only, no subject line, no markdown. "
     "Keep the signature exactly as given, at the end."
 )
+
+# v1.9.0: the same instruction, plus the user's own past replies as a style
+# reference. Separate from _POLISH_SYSTEM because the constraints differ: with
+# examples in front of it the model's pull is to reuse their CONTENT, and the
+# content of a past reply is a specific price, part number or job — sending
+# one of those to a different customer would be worse than any template.
+#
+# The examples are for cadence only: how they open, how long they run, how
+# they commit, how they sign off. Measured against the real corpus that gap is
+# wide — the quote_ack template is "Thanks for the RFQ — received. I'll get
+# back to you with pricing and availability on this shortly", where the actual
+# reply is "Good morning Dave, Will advise. Thanks!".
+_VOICE_SYSTEM = (
+    "You lightly personalize a short business email reply for an electrical "
+    "supply distributor, matching how THIS sender habitually writes. "
+    "You are given measured rules for their style, and sometimes real replies "
+    "they have sent as further reference. "
+    "Match their greeting, sentence length, directness and sign-off. "
+    "CRITICAL: copy their manner of writing ONLY. Never copy any fact from an "
+    "example — no price, part number, quantity, lead time, job name or "
+    "customer name from an example may appear in your output; those belong to "
+    "other conversations and would be wrong here. "
+    "Keep the SAME meaning and commitment as the template, and never invent "
+    "prices, availability, dates or promises the template does not make. "
+    "Prefer their brevity: if their replies are short, yours must be short. "
+    "Plain text only, no subject line, no markdown. "
+    "Keep the signature exactly as given, at the end."
+)
+
+
+# Debris that survives reply-text extraction: Outlook's plain-text divider
+# rule, and the mobile taglines that sit below the typed reply rather than
+# inside the signature block the parser strips. Harmless in the corpus, but
+# these are about to be held up to a model as "how this person writes", and
+# a tagline in an exemplar is a tagline it may reproduce.
+_VOICE_DEBRIS_RE = re.compile(
+    r"(_{5,}|-{5,}|"
+    r"get outlook for (ios|android)[^\n]*|"
+    r"sent from my (iphone|ipad|android|mobile)[^\n]*|"
+    r"<https?://[^>]*>|https?://\S+)", re.I)
+
+
+# v1.10.0: the measured profile, as rules rather than samples.
+#
+# Retrieved examples only cover categories the corpus has confirmed replies
+# for — purchase_order and transactional had none, so those drafts fell back
+# to generic polish and came out in house style. These numbers hold across
+# every category, so they apply whether or not an example exists, and they
+# state the brevity explicitly because that is the trait a model reverts on
+# first: told to "match the style" it still writes three polite sentences.
+VOICE_PROFILE = (
+    "\n\nHOUSE RULES FOR THIS SENDER (measured from 71 of their real "
+    "replies — follow these even where the examples are thin):\n"
+    "- LENGTH IS THE MAIN THING: their median reply is 14 words and a single "
+    "sentence; 82% are under 30 words. Two short sentences is the maximum. "
+    "Do not pad, do not explain, do not add pleasantries.\n"
+    "- Keep the greeting line exactly as the template has it.\n"
+    "- End with \"Thanks!\" or nothing at all. Never \"Best regards\", "
+    "\"Kind regards\", or \"Please don't hesitate\".\n"
+    "- Plain and direct. They ask a bare question when they need something "
+    "(\"What job is this for?\") rather than framing it politely.\n"
+    "- No corporate filler: never \"I appreciate you reaching out\", "
+    "\"at your earliest convenience\", \"please be advised\", or "
+    "\"thank you for your patience\"."
+)
+
+
+def _voice_block(examples, limit=5, max_chars=400):
+    """Format past replies as a style reference, newest first."""
+    picked = []
+    for ex in (examples or []):
+        t = " ".join(_VOICE_DEBRIS_RE.sub(" ", ex or "").split())
+        if len(t) < 10:
+            continue
+        picked.append(t[:max_chars])
+        if len(picked) >= limit:
+            break
+    if not picked:
+        return ""
+    return ("\n\nHOW THIS SENDER WRITES (style reference only — never reuse "
+            "any fact, price, part or name from these):\n"
+            + "\n".join("- %s" % p for p in picked))
 
 
 def polish_with_llm(template_text, original_subject, original_body,
@@ -301,39 +416,157 @@ def _clean_polish_output(text, template_text, signature):
     return t, "ok"
 
 
+_SCAFFOLD_RE = re.compile(
+    r"(CUSTOMER EMAIL:|TEMPLATE REPLY:|HOW THIS SENDER WRITES|"
+    r"STYLE REFERENCE|style reference only)", re.I)
+
+# A token that looks like a part number: mixed letters and digits, or a long
+# digit run. Used to catch an exemplar's specifics landing in a new reply.
+_SPECIFIC_TOKEN_RE = re.compile(r"\b(?=[\w-]*\d)[A-Za-z][\w-]{3,}\b|\b\d{4,}\b")
+_MONEY_RE = re.compile(r"\$\s*\d[\d,]*(?:\.\d{1,4})?")
+
+# A promise about WHEN. Observed: a quote_ack whose template says only "Will
+# advise." came back "Will send quote by end of day." Nobody committed to end
+# of day, and a delivery date invented by a 3B model is a commitment made to a
+# customer on the user's behalf — a business problem, not a style one.
+_COMMITMENT_RE = re.compile(
+    r"\b(end of (the )?day|eod|close of business|cob|"
+    r"today|tonight|tomorrow|first thing|noon|"
+    r"(mon|tues|wednes|thurs|fri|satur|sun)day|"
+    r"this (morning|afternoon|evening|week)|next week|"
+    r"within (the )?(\d+|a|an|one|two|three|four|five|24|48|72)\s*"
+    r"(minute|hour|day|week|business day)s?|"
+    r"in (\d+|one|two|three|four|five)\s*"
+    r"(minute|hour|day|week|business day)s?)\b", re.I)
+# Group 1 is the addressee. The inner alternations are non-capturing so the
+# name keeps a stable group number.
+_GREETING_RE = re.compile(
+    r"^\s*(?:hi|hello|hey|good (?:morning|afternoon|evening))"
+    r"[ \t]+([A-Za-z][a-zA-Z'-]{1,20})\s*[,:]", re.I)
+
+
+def _voice_safety_check(text, template_text, examples):
+    """Reject output that borrowed FACTS from the style examples.
+
+    The examples are real replies, so they carry real prices, part numbers and
+    customer names — and a 3B model handed five of them will reuse that
+    content, not merely the cadence. Observed directly: a draft addressed to
+    one contact came back greeting a different one, because two exemplars
+    opened that way, and
+    another echoed the prompt scaffolding verbatim.
+
+    Anything the template did not already say is treated as fabricated. That
+    is strict on purpose: the fallback is a correct template, and a template
+    beats a reply carrying another customer's price every time.
+    """
+    if _SCAFFOLD_RE.search(text):
+        return False, "echoed_prompt"
+
+    tpl = template_text or ""
+    if set(_MONEY_RE.findall(text)) - set(_MONEY_RE.findall(tpl)):
+        return False, "invented_price"
+
+    # finditer, not findall: the pattern has groups, so findall would return
+    # tuples of them rather than the matched phrase
+    def _commitments(s):
+        return {m.group(0).lower() for m in _COMMITMENT_RE.finditer(s or "")}
+
+    if _commitments(text) - _commitments(tpl):
+        return False, "invented_commitment"
+
+    ex_blob = " ".join(examples or [])
+    ex_tokens = {t.lower() for t in _SPECIFIC_TOKEN_RE.findall(ex_blob)}
+    tpl_tokens = {t.lower() for t in _SPECIFIC_TOKEN_RE.findall(tpl)}
+    for tok in _SPECIFIC_TOKEN_RE.findall(text):
+        t = tok.lower()
+        if t in ex_tokens and t not in tpl_tokens:
+            return False, "leaked_specific:%s" % tok
+    return True, "ok"
+
+
+def _repair_greeting(text, template_text):
+    """Force the greeting back to the template's addressee.
+
+    The name is not the model's to choose — render_template already resolved
+    it from the actual sender. When an exemplar's name wins instead, the reply
+    opens by calling the customer someone else, so this is repaired rather
+    than rejected: the rest of the draft is usually fine.
+    """
+    want = _GREETING_RE.match(template_text or "")
+    got = _GREETING_RE.match(text or "")
+    if not got:
+        return text
+    if not want:
+        # template greeted no one by name; drop a name the model invented
+        return text[:got.start(1)] + text[got.end(1):].lstrip()
+    if got.group(1).lower() != want.group(1).lower():
+        return text[:got.start(1)] + want.group(1) + text[got.end(1):]
+    return text
+
+
 def polish_draft(template_text, original_subject, original_body,
-                 settings=None, timeout=None):
+                 settings=None, timeout=None, voice_examples=None):
     """v1.3.0: real polish entry point. Routes through the shared host-first
     /local-fallback caller (ollama_call). Returns (text_or_None, reason)
     where reason is 'ok', 'no_llm', 'empty_template', 'no_endpoint' (both
-    host and local down), 'error:<Type>', or a cleaner rejection."""
+    host and local down), 'error:<Type>', or a cleaner rejection.
+
+    v1.9.0: `voice_examples` are the user's own past replies for this
+    category, from the confirmed corpus. Given any, the draft is shaped to
+    how they actually write instead of to the template's house style."""
     if NO_LLM:
         return None, "no_llm"
     if not template_text:
         return None, "empty_template"
-    prompt = ("CUSTOMER EMAIL:\nSubject: %s\n%s\n\nTEMPLATE REPLY:\n%s"
+    voice = _voice_block(voice_examples)
+    # The profile always applies; the examples are extra evidence when the
+    # corpus happens to have some for this category.
+    prompt = ("CUSTOMER EMAIL:\nSubject: %s\n%s\n\nTEMPLATE REPLY:\n%s%s%s"
               % (original_subject or "", (original_body or "")[:2000],
-                 template_text))
+                 template_text, VOICE_PROFILE, voice))
     raw, label = ollama_call(
-        [{"role": "system", "content": _POLISH_SYSTEM},
+        [{"role": "system", "content": _VOICE_SYSTEM},
          {"role": "user", "content": prompt}],
         timeout=timeout, deterministic=False)
     if raw is None:
         return None, label   # 'no_endpoint' or 'error:<Type>'
     sig = (settings or {}).get("signature") or DEFAULT_SETTINGS["signature"]
-    return _clean_polish_output(raw, template_text, sig)
+    text, reason = _clean_polish_output(raw, template_text, sig)
+    if text is None:
+        return text, reason
+    # Validate every polished draft, not only the ones given examples: the
+    # scaffolding and invented-price checks are about what the model does, not
+    # about what it was shown. With no examples the leak check is simply a
+    # no-op.
+    text = _repair_greeting(text, template_text)
+    ok, why = _voice_safety_check(text, template_text, voice_examples)
+    if not ok:
+        # Returning None drops the caller back to the template, which is
+        # always correct if plainer. Never ship a draft that borrowed another
+        # conversation's facts.
+        return None, why
+    return text, reason
 
 
 def make_draft(category, sender_name="", sender_addr="", subject="",
-               body="", settings=None):
+               body="", settings=None, voice_examples=None):
     """Public entry point. Returns (draft_text, source) where source is
-    'template' or 'llm'."""
+    'template', 'llm', or 'voice' when the user's own past replies shaped it.
+
+    v1.9.0: `voice_examples` is how the corpus reaches drafting at all. The
+    learning pipeline already captured the user's real replies, stripped of
+    signature and quoted thread, and LearningStore.phrasing_examples() has
+    always been able to return them per category — but nothing called it, so
+    every draft was one of eleven fixed templates verbatim and the voice the
+    app spent every import collecting was never once used to write anything.
+    """
     base = render_template(category, sender_name, sender_addr, settings)
     if not base:
         return "", "template"
     if settings and settings.get("use_llm_polish"):
         polished, _reason = polish_draft(base, subject, body,
-                                         settings=settings)
+                                         settings=settings,
+                                         voice_examples=voice_examples)
         if polished:
-            return polished, "llm"
+            return polished, ("voice" if voice_examples else "llm")
     return base, "template"

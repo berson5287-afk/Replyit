@@ -482,7 +482,8 @@ class DiagBridge:
             if body.get("with_draft"):
                 d, dsrc = drafts.make_draft(
                     res["category"], sender.split("@")[0], sender, subj,
-                    text, getattr(self.app, "settings", {}))
+                    text, getattr(self.app, "settings", {}),
+                    voice_examples=self._voice(res["category"]))
                 row["draft"] = d
                 row["draft_source"] = dsrc
             out.append(row)
@@ -507,8 +508,24 @@ class DiagBridge:
         text, src = drafts.make_draft(
             cat, body.get("sender_name", ""), body.get("sender", ""),
             body.get("subject", ""), body.get("body", ""),
-            getattr(self.app, "settings", {}))
+            getattr(self.app, "settings", {}),
+            voice_examples=self._voice(cat))
         return {"category": cat, "draft": text, "source": src}
+
+    def _voice(self, category):
+        """The app's voice examples for a category, or none.
+
+        Mirrors what the app itself passes so a draft rendered through the
+        bridge is the same draft the user would see — a diagnostic surface
+        that quietly renders something else is worse than no surface.
+        """
+        fn = getattr(self.app, "_voice_for", None)
+        if fn is None:
+            return []
+        try:
+            return fn(category)
+        except Exception:
+            return []
 
     def ep_inject(self, body, q):
         """Push synthetic emails through the REAL pipeline.
@@ -535,7 +552,8 @@ class DiagBridge:
                         res["category"] != clf.CAT_NO_REPLY:
                     draft, dsrc = drafts.make_draft(
                         res["category"], sender.split("@")[0], sender,
-                        subj, text, self.app.settings)
+                        subj, text, self.app.settings,
+                        voice_examples=self._voice(res["category"]))
                 ok = self.app.store.upsert_intake(
                     mid, it.get("received_at") or _now(), subj, sender,
                     res["features"], res["needs_reply"], res["category"],
@@ -571,7 +589,8 @@ class DiagBridge:
                     draft, dsrc = drafts.make_draft(
                         res["category"], row.get("sender", "").split("@")[0],
                         row.get("sender", ""), row.get("subject", ""),
-                        row.get("body_full") or "", self.app.settings)
+                        row.get("body_full") or "", self.app.settings,
+                        voice_examples=self._voice(res["category"]))
                 ok = self.app.store.reclassify_pending(
                     row["message_id"], res["category"], res["confidence"],
                     draft, "%s/%s" % (res["source"], dsrc),

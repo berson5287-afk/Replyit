@@ -129,15 +129,29 @@ sdir = tempfile.mkdtemp(prefix="rp_data_")
 settings = drafts.load_settings(sdir)
 check("settings created with defaults", settings["use_llm_polish"] is False and "Berson" in settings["signature"])
 d, src = drafts.make_draft(clf.CAT_QUOTE_ACK, "Mike Torres", "mtorres@abcelectric.com", settings=settings)
-check("quote_ack draft greets by first name", d.startswith("Hi Mike,"), d[:30])
+# assert the property (addressed to Mike by first name), not the literal
+# greeting — the opener is the user's measured style and may change with it
+check("quote_ack draft greets by first name", d.splitlines()[0].endswith("Mike,"), d[:30])
 check("draft carries signature", settings["signature"] in d)
 check("draft source is template", src == "template")
 d, _ = drafts.make_draft(clf.CAT_JOB_NAME, "", "estimating@bigbuild.com", settings=settings)
-check("job_name draft asks for job name", "job name" in d.lower())
+check("job_name draft asks which job it is for", "job" in d.lower() and "?" in d, d[:60])
 d, _ = drafts.make_draft(clf.CAT_NO_REPLY, "Mike", "m@x.com", settings=settings)
 check("no_reply draft is empty", d == "")
 d, _ = drafts.make_draft(clf.CAT_QUOTE_ACK, "Torres, Mike", "mtorres@abcelectric.com", settings=settings)
-check("Last,First name handled", d.startswith("Hi Mike,"), d[:30])
+check("Last,First name handled", d.splitlines()[0].endswith("Mike,"), d[:30])
+# the templates ARE the voice whenever polish is off or rejected, so hold them
+# to the measured shape: one or two short sentences, never house-style filler
+for _c in clf.REPLY_CATEGORIES:
+    _t, _ = drafts.make_draft(_c, "Mike", "m@x.com", settings=settings)
+    _body = _t.replace(settings["signature"], "").strip()
+    _bodyline = " ".join(_body.splitlines()[1:]).strip()
+    check("%s template stays terse" % _c, len(_bodyline.split()) <= 22,
+          "%d words: %s" % (len(_bodyline.split()), _bodyline[:70]))
+    check("%s template has no corporate filler" % _c,
+          not re.search(r"(best regards|kind regards|don't hesitate|"
+                        r"at your earliest convenience|please be advised)",
+                        _t, re.I), _t[:70])
 
 # ---- 4. record store: intake, decisions, idempotency ------------------------
 store = rec.RecordStore(directory=sdir)
@@ -266,7 +280,7 @@ r = clf.classify("invoice question", "cust@x.com", "Why was I charged $500.00 on
 check("prices without delivery phrase never ack", r["category"] != clf.CAT_ACK, r)
 # ack template
 d, _ = drafts.make_draft(clf.CAT_ACK, "Victor", "victor@brazill.com", settings=settings)
-check("ack draft says thank you", "Thank you" in d and d.startswith("Hi Victor,"), d[:60])
+check("ack draft says thank you", "Thank you" in d and d.splitlines()[0].endswith("Victor,"), d[:60])
 check("ack in REPLY_CATEGORIES for UI radios", clf.CAT_ACK in clf.REPLY_CATEGORIES)
 
 # ---- 12. v1.2.0: update_ai_draft (AI Review) --------------------------------
@@ -1076,6 +1090,10 @@ class _BulkApp:
         self.settings = dict(settings); self.checked = set(_mids)
         self.sent = []; self.refreshed = 0; self.ai_queue = {}
     def _refresh_lists(self): self.refreshed += 1
+    # no learning store in this stub, so no voice examples — the same thing
+    # the real app returns when the corpus has nothing confirmed for a
+    # category, which is what makes drafting fall back to the template
+    def _voice_for(self, category): return []
     def send_reply_async(self, mid, sender, subject, body):
         self.sent.append((mid, body))
 
@@ -1164,8 +1182,9 @@ check("chase detection only reads the top of the body",
 # template + taxonomy wiring
 _d, _ = drafts.make_draft(clf.CAT_QUOTE_IN_PROCESS, "Robert", "rbell@x.com", settings=settings)
 check("in_process template confirms work underway",
-      "being worked on" in _d and "patience" in _d.lower(), _d[:70])
-check("in_process draft greets by first name", _d.startswith("Hi Robert,"))
+      "being worked on" in _d and "shortly" in _d.lower(), _d[:70])
+check("in_process draft greets by first name",
+      _d.splitlines()[0].endswith("Robert,"), _d[:30])
 check("in_process is a UI reply choice", clf.CAT_QUOTE_IN_PROCESS in clf.REPLY_CATEGORIES)
 check("quote family grouped for the dropdown",
       set(clf.QUOTE_CATEGORIES) == {clf.CAT_QUOTE_ACK, clf.CAT_QUOTE_IN_PROCESS,
