@@ -30,6 +30,14 @@ pythonw replypilot.pyw
 Data lives in `%LOCALAPPDATA%\ReplyPilot` (database, audit log, settings,
 outbox drafts) — deliberately outside OneDrive to avoid sync file locks.
 
+`settings.json` is read with `utf-8-sig`, so a byte-order mark (which
+PowerShell's `Out-File -Encoding utf8` and several editors add) does not make
+it unreadable. If it genuinely cannot be parsed it is moved to
+`settings.json.corrupt` rather than left in place: the app would otherwise run
+on defaults — no scan folders, default AI host, default signature — and the
+next ordinary save would write those defaults over the real file, so one bad
+byte would destroy the configuration permanently.
+
 ## Files
 
 | File | Role |
@@ -249,6 +257,21 @@ The heuristic's findings are also passed to the model as named signals
 evidence rather than as an answer — a model told the answer cannot
 corroborate it.
 
+### Endpoint cooldown
+
+An endpoint that answers `/api/tags` is not an endpoint that can answer a
+chat. Seen in practice: a host listed every model and passed every
+reachability check while `llama-server` died on a CUDA fault for all of them,
+a 1B model included. Each call probed the host, waited out the crash, and only
+then fell back — 10-45 seconds of dead time on every email, which is what made
+draft polish impractical to leave switched on.
+
+A failed chat now puts that endpoint in a cooldown (`ENDPOINT_COOLDOWN_SEC`,
+300s, override with `REPLYPILOT_ENDPOINT_COOLDOWN`) and the walk skips it
+until the cooldown lapses, at which point one call pays the cost again to
+find out whether it recovered. Measured on the broken host: **56.5s on the
+first call, 0.9s on every call after**. `GET /config` reports what is cooling.
+
 Environment overrides: `REPLYPILOT_OLLAMA_HOST` / `_PORT` / `_MODEL` /
 `_TIMEOUT` for the host, `REPLYPILOT_LOCAL_HOST` / `_LOCAL_PORT` /
 `_LOCAL_MODEL` for the fallback, `REPLYPILOT_HOST_PROBE` for the reachability
@@ -315,6 +338,10 @@ one test reply to yourself — before trusting them.
 
 | Version | Change |
 |---|---|
+| 1.18.0 | Templates rewritten to the user's measured voice; `VOICE_PROFILE` applied to every polish; invented-commitment guard; role addresses get no first name |
+| 1.17.0 | Endpoint cooldown so a broken host costs one call, not every call; settings survive a BOM and are quarantined rather than overwritten |
+| 1.16.0 | Drafts written in the user's voice from confirmed replies, with fact-leak validation; outbound vendor asks excluded from learning |
+| 1.15.0 | Heuristic/LLM arbitration and calibrated confidence; bulk-mail and ticketing detection; attachment-priced deliveries; Confirm refuses unread imports |
 | 1.14.0 | Diagnostic bridge for external inspection |
 | 1.13.0 | Deterministic classification; `purchase_order` and `transactional`; Reclassify Pending |
 | 1.12.x | `needs_input` flag + tab; AI Review Queue with cancel; one row, one tab |

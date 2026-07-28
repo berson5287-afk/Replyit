@@ -28,6 +28,7 @@ ENGINE_VERSION = "1.10.0"  # v1.10.0: heuristic/LLM arbitration + calibrated
 import os
 import re
 import json
+import time
 import urllib.request
 
 # ------------------------------------------------------------------- taxonomy
@@ -522,6 +523,53 @@ _LLM_SYSTEM = (
 )
 
 
+# ------------------------------------------------- v1.11.0: endpoint health
+# An endpoint that answers /api/tags is not an endpoint that can answer a
+# chat. On this install the host lists every model and passes every
+# reachability check, while llama-server dies on a CUDA fault for all of them
+# — a 1B model included. So each call probed the host, waited out the crash,
+# and only then fell back to local: 10-45 seconds of dead time on every single
+# email, which is what made draft polish impractical to leave switched on.
+#
+# A failed chat therefore puts that endpoint in a cooldown and the walk skips
+# it until the cooldown lapses, at which point one call pays the cost again to
+# find out whether it recovered. Keyed on host:port rather than label so a
+# reconfiguration cannot inherit a stale verdict.
+ENDPOINT_COOLDOWN_SEC = int(os.environ.get("REPLYPILOT_ENDPOINT_COOLDOWN",
+                                           "300"))
+_endpoint_down_until = {}
+
+
+def _cooldown_key(host, port):
+    return "%s:%d" % (host, port)
+
+
+def endpoint_cooling(host, port, now=None):
+    """True if this endpoint recently failed a chat and is being skipped."""
+    until = _endpoint_down_until.get(_cooldown_key(host, port), 0)
+    return until > (now if now is not None else time.time())
+
+
+def mark_endpoint_down(host, port, now=None):
+    now = now if now is not None else time.time()
+    _endpoint_down_until[_cooldown_key(host, port)] = now + ENDPOINT_COOLDOWN_SEC
+
+
+def mark_endpoint_up(host, port):
+    _endpoint_down_until.pop(_cooldown_key(host, port), None)
+
+
+def endpoint_health():
+    """{host:port: seconds_remaining} for endpoints currently cooling."""
+    now = time.time()
+    return {k: round(v - now, 1)
+            for k, v in _endpoint_down_until.items() if v > now}
+
+
+def reset_endpoint_health():
+    _endpoint_down_until.clear()
+
+
 def ollama_call(messages, fmt=None, timeout=None, probe=True,
                 deterministic=True):
     """v1.2.0: shared low-level Ollama caller with host-first fallback.
@@ -539,7 +587,12 @@ def ollama_call(messages, fmt=None, timeout=None, probe=True,
     harmless."""
     last_reason = "no_endpoint"
     tried_any = False
+    cooling = 0
     for label, host, port, model in _endpoints():
+        if endpoint_cooling(host, port):
+            # failed a real chat recently — skip without paying its timeout
+            cooling += 1
+            continue
         if probe and not endpoint_reachable(host, port):
             continue
         tried_any = True
@@ -558,39 +611,94 @@ def ollama_call(messages, fmt=None, timeout=None, probe=True,
             with urllib.request.urlopen(
                     req, timeout=timeout or OLLAMA_TIMEOUT) as r:
                 data = json.loads(r.read().decode("utf-8", "replace"))
+            mark_endpoint_up(host, port)
             return ((data.get("message") or {}).get("content", ""), label)
         except Exception as e:
             last_reason = "error:%s" % e.__class__.__name__
+            mark_endpoint_down(host, port)
             continue  # fall through to next endpoint (host busy -> local)
+    if not tried_any and cooling:
+        # everything is cooling; say so rather than claiming nothing is
+        # configured, and let the cooldown lapse re-test it later
+        return None, "cooling_down"
     return None, (last_reason if tried_any else "no_endpoint")
 
 
 def _ollama_chat(prompt, timeout=None):
-    content, _label = ollama_call(
+    """Returns (content, endpoint_label). The label is carried out rather than
+    dropped because which endpoint answered is not a detail — see classify()."""
+    content, label = ollama_call(
         [{"role": "system", "content": _LLM_SYSTEM},
          {"role": "user", "content": prompt}],
         fmt="json", timeout=timeout)
-    return content or ""
+    return (content or ""), label
 
 
-def classify_llm(subject, sender, body):
-    """Returns (needs_reply, category, confidence) or None on any failure."""
+def _signal_block(feats):
+    """v1.10.0: the deterministic signals, restated for the model.
+
+    The heuristic has already read the mail with an electrical distributor's
+    vocabulary — it knows a PO subject from an RFQ, a chase from a fresh
+    request, and a proof-of-delivery from an enquiry. That work was being
+    thrown away: the model saw only raw text and re-derived it, worse, from
+    general knowledge. Handing it the findings costs nothing and grounds the
+    judgement in domain rules.
+
+    Deliberately phrased as observations, not as an answer. Naming the
+    heuristic's category here would collapse the two into one voice, and the
+    agreement between them is precisely what arbitrate() treats as evidence —
+    a model that has been told the answer cannot corroborate it.
+    """
+    named = [k for k in ("po", "transactional", "chase", "quoteish", "jobish",
+                         "delivery_phrase", "pricing_delivered",
+                         "asks_to_quote", "is_reply", "has_qty", "escalate")
+             if feats.get(k)]
+    if feats.get("part_tokens"):
+        named.append("part_numbers=%d" % feats["part_tokens"])
+    if feats.get("price_count"):
+        named.append("dollar_figures=%d" % feats["price_count"])
+    if not named:
+        return ""
+    return ("\n\nPattern signals detected in this email (evidence, not a "
+            "verdict — weigh them against what you read): %s"
+            % ", ".join(named))
+
+
+def classify_llm(subject, sender, body, feats=None):
+    """Returns (needs_reply, category, confidence, endpoint) or None.
+
+    v1.10.0: the confidence is normalized rather than trusted verbatim.
+    Measured against the live queue, gemma3 reports 0.90 or 1.00 for 43 of 67
+    emails and occasionally 0.0 — those are the model's habitual numbers, not
+    a calibrated probability, and a 0.0 in particular means the field went
+    unfilled rather than "certainly wrong". Anything outside a plausible band
+    is treated as unstated and replaced with LLM_UNSTATED_CONFIDENCE, so a
+    made-up number cannot masquerade as evidence downstream.
+    """
     if NO_LLM:
         return None
-    prompt = ("From: %s\nSubject: %s\n\n%s"
-              % (sender or "", subject or "", (body or "")[:4000]))
+    prompt = ("From: %s\nSubject: %s\n\n%s%s"
+              % (sender or "", subject or "", (body or "")[:4000],
+                 _signal_block(feats or {})))
     try:
-        raw = _ollama_chat(prompt)
+        raw, endpoint = _ollama_chat(prompt)
         raw = raw.strip().removeprefix("```json").removeprefix("```")\
                  .removesuffix("```").strip()
         obj = json.loads(raw)
         cat = str(obj.get("category", "")).strip()
         if cat not in CATEGORIES:
             return None
-        needs = bool(obj.get("needs_reply", cat != CAT_NO_REPLY))
-        conf = float(obj.get("confidence", 0.5))
-        conf = max(0.0, min(1.0, conf))
-        return needs, cat, conf
+        try:
+            conf = float(obj.get("confidence"))
+        except (TypeError, ValueError):
+            conf = LLM_UNSTATED_CONFIDENCE
+        if not (0.05 <= conf <= 1.0):
+            conf = LLM_UNSTATED_CONFIDENCE
+        # needs_reply is derived from the category rather than read from the
+        # model. The two are the same fact, and letting them disagree produced
+        # rows labelled with a reply type but marked as needing no reply,
+        # which the auto-send engine then silently skipped.
+        return (cat != CAT_NO_REPLY), cat, conf, endpoint
     except Exception:
         return None
 
