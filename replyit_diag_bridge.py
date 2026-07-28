@@ -337,11 +337,55 @@ class DiagBridge:
         s = dict(getattr(self.app, "settings", {}) or {})
         # the signature is the user's own contact block — summarize, don't emit
         s["signature"] = "<%d chars>" % len(s.get("signature") or "")
-        return {"ai": clf.ai_settings_defaults(),
-                "endpoints": [{"label": l, "host": h, "port": p, "model": m}
-                              for l, h, p, m in clf._endpoints()],
-                "no_llm": clf.NO_LLM,
-                "settings": s}
+        eps = []
+        for l, h, p, m in clf._endpoints():
+            e = {"label": l, "host": h, "port": p, "model": m,
+                 "reachable": clf.endpoint_reachable(h, p),
+                 "model_listed": clf.model_available(h, p, m)}
+            eps.append(e)
+        out = {"ai": clf.ai_settings_defaults(),
+               "endpoints": eps,
+               "no_llm": clf.NO_LLM,
+               # endpoints currently skipped because a real chat failed;
+               # the value is seconds until they are retried
+               "cooling_down": clf.endpoint_health(),
+               "settings": s}
+        if (q.get("probe") or ["0"])[0] == "1":
+            out["live_probe"] = self._probe_chat(clf)
+        return out
+
+    def _probe_chat(self, clf):
+        """Which endpoint actually ANSWERS a classification call right now?
+
+        Worth asking separately because the two claims came apart on a real
+        install: the host listed gemma3:27b in /api/tags and passed every
+        reachability check, while each chat call died on a CUDA fault. Every
+        email then fell back to a 3B local model, silently, and nothing said
+        so — the corpus filled with labels from a model nobody chose. Listing
+        a model is not the same claim as being able to run it.
+
+        So this issues one real chat through the same walk classification uses
+        and reports who answered. If that is not the first configured
+        endpoint, the fallback is live and the stored labels are not coming
+        from the model in Settings.
+        """
+        t0 = time.time()
+        content, label = clf.ollama_call(
+            [{"role": "user", "content": "Reply with only the word OK."}],
+            timeout=45, probe=False)
+        took = round(time.time() - t0, 1)
+        order = [l for l, _h, _p, _m in clf._endpoints()]
+        if content is None:
+            return {"answered_by": None, "seconds": took, "reason": label,
+                    "note": "no endpoint completed a chat call; "
+                            "classification is running on heuristics alone"}
+        res = {"answered_by": label, "seconds": took,
+               "reply": (content or "").strip()[:40]}
+        if order and label != order[0]:
+            res["note"] = ("FALLBACK ACTIVE — %r is configured first but %r "
+                           "served this call; labels are not coming from the "
+                           "model named in Settings" % (order[0], label))
+        return res
 
     def ep_stats(self, q):
         st = self.app.store

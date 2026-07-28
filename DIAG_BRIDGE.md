@@ -62,7 +62,7 @@ curl.exe -H "X-Diag-Token: $($t.token)" "$($t.base_url)/state"
 | `/health` | liveness, no auth, no data |
 | `/` | endpoint index |
 | `/state` | tab counts, action counts, AI queue, origin split |
-| `/config` | effective AI settings + resolved endpoints (signature redacted) |
+| `/config` | effective AI settings + resolved endpoints (signature redacted); `?probe=1` also issues one real chat call |
 | `/stats` | per-category graduation numbers |
 | `/pending` | pending rows — `?category=`, `?max_conf=`, `?limit=`, `?full=1` |
 | `/decided` | decided rows — `?action=`, `?limit=` |
@@ -130,6 +130,31 @@ Response carries a summary plus every miss:
 5. `GET /stats` — whether any category is nearing graduation, and on what
    agreement rate
 6. `GET /autosend` — confirm nothing is eligible that shouldn't be
+
+## `/config?probe=1` — is the fallback live?
+
+`/config` reports each endpoint's `reachable` (does `/api/tags` answer) and
+`model_listed` (is the configured model in that list). Neither claim is the
+one that matters, and on a real install they came apart: the host listed
+`gemma3:27b` and passed every reachability check while each chat call died on
+a CUDA fault, so every email fell back to a 3B local model — silently, with
+nothing in the app saying so. Listing a model is not the same claim as being
+able to run it.
+
+`?probe=1` issues one real chat through the same host-then-local walk that
+classification uses and reports who answered:
+
+```json
+"live_probe": {
+  "answered_by": "local", "seconds": 21.4, "reply": "OK",
+  "note": "FALLBACK ACTIVE — 'host' is configured first but 'local' served
+           this call; labels are not coming from the model named in Settings"
+}
+```
+
+Worth checking before trusting any accuracy measurement, because a label is
+only as good as the model that produced it. Costs one round trip, and takes
+the full timeout when the first endpoint is the broken one.
 
 ## Notes
 

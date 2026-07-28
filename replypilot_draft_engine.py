@@ -59,19 +59,62 @@ def save_settings(directory, settings):
 
 
 def load_settings(directory):
+    """Load settings, tolerating a BOM and never silently discarding a file.
+
+    Falling back to defaults on any read error looks safe and is not: the app
+    then runs on a default AI host with no scan folders and no signature, and
+    the next ordinary save (moving a window is enough) writes those defaults
+    over the real file. A single unreadable byte thereby destroys the
+    configuration permanently.
+
+    Two changes. utf-8-sig, because a BOM is what any number of editors and
+    PowerShell's Out-File put at the front of a JSON file, and it is not
+    corruption — the settings behind it are perfectly good. And when the file
+    genuinely cannot be parsed, it is moved aside rather than left in place to
+    be overwritten, so the contents survive for recovery.
+    """
     path = os.path.join(directory, SETTINGS_NAME)
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_SETTINGS, f, indent=2)
         return dict(DEFAULT_SETTINGS)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig reads with or without a BOM
+        with open(path, "r", encoding="utf-8-sig") as f:
             s = json.load(f)
         merged = dict(DEFAULT_SETTINGS)
         merged.update(s if isinstance(s, dict) else {})
         return merged
     except Exception:
+        _quarantine_settings(path)
         return dict(DEFAULT_SETTINGS)
+
+
+def _quarantine_settings(path):
+    """Move an unparseable settings file aside so a save cannot clobber it."""
+    for n in range(1, 100):
+        dest = "%s.corrupt%s" % (path, "" if n == 1 else str(n))
+        if not os.path.exists(dest):
+            try:
+                os.replace(path, dest)
+            except OSError:
+                pass
+            return dest
+    return ""
+
+
+# Local-parts that name a function, not a person. Deriving a first name from
+# the address is right for dave@ and wrong for estimating@ — "Good morning
+# Estimating," is a worse opening than no name at all, and these role
+# addresses are most of an RFQ inbox.
+_ROLE_LOCALPART = frozenset((
+    "sales", "info", "estimating", "estimator", "purchasing", "purchase",
+    "accounts", "accounting", "orders", "order", "service", "support",
+    "admin", "office", "quotes", "quote", "bids", "bid", "ap", "ar",
+    "billing", "invoices", "contact", "team", "help", "enquiries",
+    "inquiries", "noreply", "no-reply", "mail", "email", "shipping",
+    "receiving", "warehouse", "dispatch", "customerservice", "cs",
+))
 
 
 def _first_name(sender_name, sender_addr):
