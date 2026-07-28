@@ -158,6 +158,37 @@ unstable label cannot be learned from, because the agreement rate would be
 measuring sampling noise as much as judgement. Draft polish keeps its
 variation, where it is harmless.
 
+## Arbitration: how the two classifiers combine
+
+The heuristics and the LLM are independent readers — one is regex over an
+electrical distributor's vocabulary, the other a general model reading the
+prose — so they are combined rather than ranked:
+
+| Outcome | Category | Confidence |
+|---|---|---|
+| Both agree | that category | boosted, capped at 0.95 |
+| They disagree, heuristic matched a rule | the LLM's | capped at 0.50 |
+| They disagree, heuristic only fell through | the LLM's | capped at 0.80 |
+| LLM unreachable | the heuristic's | unchanged |
+
+Agreement between two independent readers is real corroboration and is the
+only path to a high confidence. Disagreement means the email is hard, and a
+hard email is exactly the one a human should see — so a contested row is
+capped below any sane auto-send threshold instead of being resolved by fiat.
+
+This matters because confidence is not a display detail: it is gate 5 of the
+auto-send engine. Previously the LLM's answer replaced the heuristic outright
+and carried the model's self-reported confidence straight to that gate. That
+number is not calibrated — on the live queue gemma3 reported 0.90 or 1.00 for
+43 of 67 emails — and the override was unconditional, so an answer the model
+itself scored 0.00 displaced a heuristic holding 0.75. Confidences outside a
+plausible band are now treated as unstated rather than believed.
+
+The heuristic's findings are also passed to the model as named signals
+(`po`, `chase`, `pricing_delivered`, part-number counts …), phrased as
+evidence rather than as an answer — a model told the answer cannot
+corroborate it.
+
 Environment overrides: `REPLYPILOT_OLLAMA_HOST` / `_PORT` / `_MODEL` /
 `_TIMEOUT` for the host, `REPLYPILOT_LOCAL_HOST` / `_LOCAL_PORT` /
 `_LOCAL_MODEL` for the fallback, `REPLYPILOT_HOST_PROBE` for the reachability
