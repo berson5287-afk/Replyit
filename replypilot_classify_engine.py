@@ -256,6 +256,41 @@ _NOREPLY_BODY_RE = re.compile(
     r"(this is an automated (message|email)|do not reply to this|"
     r"unsubscribe|out of the office|auto[- ]?generated)", re.I)
 
+# v1.10.0: bulk-mail and ticketing infrastructure.
+#
+# These were the single largest source of wrong answers in the live corpus:
+# 78 of 117 deleted rows had been filed as quote_ack, and the recurring
+# offenders were a scheduled ERP report notice (six copies), a support
+# case-closed notice, a helpdesk ticket thread and a supplier service notice.
+# None of them look automated to the existing rules —
+# they arrive from a plausible human-looking address with ordinary prose and
+# no "do not reply" boilerplate — so whatever product vocabulary they happen
+# to contain ("in stock", "availability") fell through to the quoteish branch
+# and became an RFQ acknowledgement.
+#
+# Matching on the delivery infrastructure instead of on tone is what makes
+# this reliable: a click-tracking redirect, a helpdesk ticket URL or a
+# "view this email in your browser" line is emitted by bulk-sending software
+# and effectively never appears in a hand-written RFQ.
+_BULK_INFRA_RE = re.compile(
+    r"(view (this email|it) in your (browser|web browser)|"
+    r"\.ct\.sendgrid\.net|sendgrid\.net/wf/open|"
+    r"click\.[\w.-]+/open\.aspx|"
+    r"/helpdesk/tickets/\d+|/servicedesk/|\.zendesk\.com/|"
+    r"your case has been (closed|updated|created|assigned)|"
+    r"(report|export) is complete\.)", re.I)
+
+# Automation that identifies itself by domain rather than by local-part, which
+# is all _NOREPLY_SENDER_RE looks at.
+_BULK_SENDER_RE = re.compile(
+    r"@([\w-]*\.)?(service-now\.com|freshdesk\.com|zendesk\.com|"
+    r"sendgrid\.net|mailchimp(app)?\.com|"
+    r"constantcontact\.com|salesforce\.com)", re.I)
+
+# A ticket reference carried in the subject, e.g. "Re: [#12345] - ...".
+_TICKET_SUBJECT_RE = re.compile(
+    r"(\[#\d{3,}\]|\bcase\s+[A-Z]{2}\d{6,}\b|\bticket\s*#\s*\d{3,})", re.I)
+
 _THANKS_ONLY_RE = re.compile(
     r"^\s*(thanks?( you)?|thank you|got it|received|perfect|great,?\s*thanks?|"
     r"sounds good|will do|ok(ay)?|appreciate it)[.!\s]*$", re.I)
@@ -292,6 +327,40 @@ _DELIVERY_RE = re.compile(
     r"let us know if you have any questions)", re.I)
 _PRICE_RE = re.compile(r"\$\s*\d[\d,]*(\.\d{1,4})?")
 
+# v1.10.0: the two-signal rule above (delivery phrase AND a $ figure) misses
+# the most common shape of a real delivery, because vendors send pricing as an
+# attached PDF and write no figure in the body at all. Both "Re: P&A" rows the
+# user recategorized were exactly this: a vendor answering with the P&A
+# attached, filed as quote_ack — which tells someone who just sent you pricing
+# that you will get back to them with pricing.
+#
+# The missing signal is direction. A reply carrying "pricing attached" is a
+# delivery; the same words in a fresh thread are not. So this fires only on a
+# reply, and only when the delivery phrase names the pricing itself rather
+# than being a generic "see attached".
+#
+# Matched against the LEAD of the body only, for the same reason _CHASE_RE is:
+# a reply carries the whole thread quoted underneath it, and any thread about
+# pricing contains "quote attached" somewhere further down. Scanning the full
+# body turned genuine quote_delivered replies into acknowledgements by reading
+# the history instead of the message.
+_PRICING_DELIVERED_RE = re.compile(
+    r"((quote|quotation|pricing|price and avail\w*|p\s*[&/]\s*a)\b"
+    r"[^.\n]{0,30}(attached|enclosed|below|is ready)|"
+    r"attach\w*\s+(is\s+|are\s+)?(our|the|your)?\s*"
+    r"(quote|quotation|pricing|proposal)|"
+    r"here('?s| is| are)\s+(the|our|your)\s+"
+    r"(quote|quotation|pricing|numbers|price))", re.I)
+
+# An explicit request to BE quoted. Used to veto delivery/order readings —
+# however much pricing language a mail carries, an explicit ask outranks it.
+_ASK_TO_QUOTE_RE = re.compile(
+    r"\b(rfq|request for quote|please quote|need (a )?(price|quote)|"
+    r"bid due|quote request|can you (quote|price)|"
+    r"please provide (a )?(quote|pricing|price))\b", re.I)
+
+_REPLY_SUBJECT_RE = re.compile(r"^\s*(re|fw|fwd)\s*:", re.I)
+
 # v1.9.0: an inbound purchase order. Anchored to the SUBJECT, because a
 # quote request routinely mentions a PO number in passing ("Re: Bid
 # S100100277 PO# RFQ-503628" is a bid, not an order) — the subject leading
@@ -304,10 +373,9 @@ _PO_BODY_RE = re.compile(
     r"|(purchase order|p\.?o\.?) (is )?(attached|enclosed)"
     r"|please (process|enter|acknowledge) (this|our|the) order"
     r"|here is (our|the) (purchase order|po)\b)", re.I)
-# a request to price it is not an order, however many PO numbers it cites
-_PO_NEGATE_RE = re.compile(
-    r"\b(rfq|request for quote|please quote|need (a )?(price|quote)|"
-    r"bid due|quote request)\b", re.I)
+# A request to price it is not an order, however many PO numbers it cites.
+# v1.10.0: this veto is _ASK_TO_QUOTE_RE (defined above), which says the same
+# thing the delivery branch needs and says it slightly wider.
 
 # v1.9.0: routine transactional paperwork
 _TRANSACTIONAL_RE = re.compile(
@@ -355,6 +423,14 @@ def extract_features(subject, sender, body):
             "%s\n%s" % (subject or "", body or ""))),                # v1.7.0
         "delivery_phrase": bool(_DELIVERY_RE.search(body or "")),  # v1.1.0
         "price_count": len(_PRICE_RE.findall(body or "")),         # v1.1.0
+        # v1.10.0
+        "bulk_infra": bool(_BULK_INFRA_RE.search(body or "")
+                           or _BULK_SENDER_RE.search(sender or "")
+                           or _TICKET_SUBJECT_RE.search(subject or "")),
+        "is_reply": bool(_REPLY_SUBJECT_RE.search(subject or "")),
+        "pricing_delivered": bool(
+            _PRICING_DELIVERED_RE.search((body or "")[:400])),
+        "asks_to_quote": bool(_ASK_TO_QUOTE_RE.search(text)),
     }
     return feats
 
@@ -365,14 +441,18 @@ def classify_heuristic(subject, sender, body):
 
     if f["noreply_sender"] or f["noreply_subject"] or f["noreply_body"]:
         return False, CAT_NO_REPLY, 0.9, f
+    # v1.10.0: bulk/ticketing infrastructure, before anything else reads the
+    # prose. These carry ordinary sentences and would otherwise be scored on
+    # their vocabulary alone.
+    if f["bulk_infra"]:
+        return False, CAT_NO_REPLY, 0.88, f
     if f["thanks_only"]:
         return False, CAT_NO_REPLY, 0.85, f
     if f["escalate"]:
         return True, CAT_ESCALATE, 0.7, f
     # an order, or routine paperwork, before any quote reasoning — both were
     # being answered as though the sender wanted a price
-    if f["po"] and not _PO_NEGATE_RE.search(
-            "%s\n%s" % (subject or "", body or "")):
+    if f["po"] and not f["asks_to_quote"]:
         return True, CAT_PURCHASE_ORDER, 0.7, f
     if f["transactional"]:
         return True, CAT_TRANSACTIONAL, 0.6, f
@@ -386,6 +466,11 @@ def classify_heuristic(subject, sender, body):
         # "I'll get back to you". Must come before the quoteish branch since
         # P&A bodies are full of quote language.
         return True, CAT_ACK, 0.7, f
+    if f["is_reply"] and f["pricing_delivered"] and not f["asks_to_quote"]:
+        # v1.10.0: the same delivery, priced in an attachment rather than in
+        # the body. Requires a reply subject so a fresh "pricing attached"
+        # thread isn't swept up, and defers to an explicit ask to be quoted.
+        return True, CAT_ACK, 0.65, f
     if f["quoteish"]:
         if f["jobish"] and f["part_tokens"] == 0:
             # project/bid language but nothing concrete to price
