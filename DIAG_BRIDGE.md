@@ -13,6 +13,15 @@ pythonw replypilot.pyw
 Optional: `$env:REPLYIT_DIAG_PORT="8765"` (default 8765; if taken, the bridge
 walks up to the next free port and records which one it took).
 
+That walk depends on the bind actually failing, which needed fixing to work
+on Windows. `HTTPServer` sets `allow_reuse_address = 1`, and there SO_REUSEADDR
+lets a second process bind a port another process is already listening on —
+silently, with no `OSError`. Since MaINbox's bridge defaults to the same 8765,
+Replyit bound straight over it and which process received a given connection
+was arbitrary; the symptom was a 401 against the *other* app's token rather
+than a bind error. The bridge now binds with `allow_reuse_address = False`, so
+a collision raises and the walk lands on 8766 as intended.
+
 It is **off** unless `REPLYIT_DIAG=1`. Nothing listens otherwise.
 
 ## Getting the token

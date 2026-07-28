@@ -147,6 +147,21 @@ class _Handler(BaseHTTPRequestHandler):
                                     "trace": traceback.format_exc()})
 
 
+class _Server(HTTPServer):
+    """HTTPServer whose bind actually fails when the port is taken.
+
+    HTTPServer sets allow_reuse_address = 1, which on Windows means SO_REUSEADDR
+    lets a second process bind a port another process is already listening on,
+    silently, with no OSError. The port-walk in start() is written around that
+    OSError, so with the inherited default the walk never fires: Replyit binds
+    over whatever already owns the port (MaINbox's bridge, on the same default
+    8765), and which process receives a given connection is then arbitrary.
+    That surfaces as authentication failures against the *other* app's token
+    rather than as a bind error, which is a long way from the real cause.
+    """
+    allow_reuse_address = False
+
+
 class DiagBridge:
     """Read/inspect surface over a live Replyit instance."""
 
@@ -198,8 +213,8 @@ class DiagBridge:
         last = None
         for offset in range(0, 10):     # port may be taken by a stale run
             try:
-                httpd = HTTPServer(("127.0.0.1", self.port + offset),
-                                   _Handler)
+                httpd = _Server(("127.0.0.1", self.port + offset),
+                                _Handler)
             except OSError as e:
                 last = e
                 continue
