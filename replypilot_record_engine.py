@@ -4,7 +4,9 @@
 # Keyed on Internet Message-ID (never EntryID). Schema is frozen from v1 —
 # additive changes only, so the training corpus stays usable forever.
 
-ENGINE_VERSION = "1.5.0"
+ENGINE_VERSION = "1.6.0"
+# v1.6.0: the graduation bar is per-store and settable from settings,
+#         with floors, plus graduation_preview for the settings UI
 # v1.5.0: reclassify_pending (re-run classification without touching corpus)
 # v1.4.0: needs_input column (+ migration) and set_needs_input
 # v1.3.0: origin column (+ migration) and import_decided_record, so records

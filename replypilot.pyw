@@ -146,7 +146,7 @@
 #     no endpoint touches Outlook COM. Reads go straight to SQLite; anything
 #     that mutates app state is marshalled onto the Tk main thread.
 
-APP_TITLE = "Replyit v1.14.0"
+APP_TITLE = "Replyit v1.15.0"
 
 import os
 import re
@@ -698,9 +698,12 @@ class ReplyPilotApp:
         self.tree_done.bind("<Double-1>",
             lambda e: self._open_review(self.tree_done, read_only=True))
 
-        # Delete key on queue / no-reply / decided → soft-delete selection
-        for tree in (self.tree_queue, self.tree_input, self.tree_noreply,
-                     self.tree_done):
+        # Delete key on auto-send / queue / no-reply / decided → soft-delete.
+        # Auto-Send included because _delete_selection already cancels the
+        # scheduled send before recording, so binning a queued reply stops it
+        # going out rather than racing it.
+        for tree in (self.tree_autosend, self.tree_queue, self.tree_input,
+                     self.tree_noreply, self.tree_done):
             tree.bind("<Delete>", lambda e, t=tree: self._delete_selection(t))
         # Delete on deleted tab → permanent hard-delete (with confirm)
         self.tree_deleted.bind("<Delete>",

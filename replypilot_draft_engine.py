@@ -5,7 +5,18 @@
 # a dependency. Settings (signature, company name) live in settings.json in
 # the ReplyPilot data dir and are created with defaults on first run.
 
-ENGINE_VERSION = "1.8.0"  # v1.8.0: purchase_order + transactional templates
+ENGINE_VERSION = "1.13.0"  # v1.13.0: drip + graduation-bar settings defaults
+                          # v1.12.0: graduation bar settings defaults
+                          # v1.11.0: hold in minutes, per-category opt-in and
+                          # auto-refresh settings defaults
+                          # v1.10.0: templates rewritten to the user's
+                          # measured voice; VOICE_PROFILE on every polish;
+                          # role addresses get no first name
+                          # v1.9.0: confirmed replies used as voice exemplars,
+                          # with validation against fact leaks
+                          # v1.8.1: settings survive a BOM; an unparseable
+                          # settings file is quarantined, not overwritten
+                          # v1.8.0: purchase_order + transactional templates
                           # v1.7.0: quote_in_process template
                           # v1.6.0: strip_configured_signature
                           # v1.5.0: Outlook signature discovery/import

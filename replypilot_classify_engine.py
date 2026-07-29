@@ -7,7 +7,11 @@
 # Closed taxonomy — categories are FIXED. This is what makes the learning
 # loop measurable. Do not add free-form categories.
 
-ENGINE_VERSION = "1.10.0"  # v1.10.0: heuristic/LLM arbitration + calibrated
+ENGINE_VERSION = "1.12.0"  # v1.12.0: a timeout no longer cools an endpoint
+                          # like a crash does
+                          # v1.11.0: endpoint cooldown — a chat that fails is
+                          # skipped rather than retried on every email
+                          # v1.10.0: heuristic/LLM arbitration + calibrated
                           # confidence; bulk-mail and ticketing detection;
                           # attachment-priced deliveries; signals passed to
                           # the LLM

@@ -426,13 +426,7 @@ one test reply to yourself — before trusting them.
 
 | Version | Change |
 |---|---|
-| 1.21.0 | Auto-sends are dripped one at a time instead of firing as a burst |
-| 1.20.0 | Configurable graduation bar with a live preview of what it would release; timeouts no longer cool an endpoint like a crash |
-| 1.19.0 | Auto-Send tab with live countdown; per-category auto-send opt-in; hold window in minutes; timed auto-refresh |
-| 1.18.0 | Templates rewritten to the user's measured voice; `VOICE_PROFILE` applied to every polish; invented-commitment guard; role addresses get no first name |
-| 1.17.0 | Endpoint cooldown so a broken host costs one call, not every call; settings survive a BOM and are quarantined rather than overwritten |
-| 1.16.0 | Drafts written in the user's voice from confirmed replies, with fact-leak validation; outbound vendor asks excluded from learning |
-| 1.15.0 | Heuristic/LLM arbitration and calibrated confidence; bulk-mail and ticketing detection; attachment-priced deliveries; Confirm refuses unread imports |
+| 1.15.0 | **Classification:** heuristic/LLM arbitration with calibrated confidence; bulk-mail and ticketing detection; attachment-priced deliveries read as acknowledgements. **Voice:** templates rewritten to the user's measured style, `VOICE_PROFILE` on every polish, confirmed replies as exemplars, and validation that rejects invented prices, leaked part numbers and invented delivery commitments. **Auto-send:** Auto-Send tab with live countdown, review and Delete from it, per-category opt-in, hold in minutes, drip release instead of a burst, configurable graduation bar with a preview of what it releases. **Learning:** Confirm refuses rows the importer never classified; outbound vendor asks excluded. **Resilience:** endpoint cooldown that tells a timeout from a crash; settings survive a BOM and are quarantined rather than overwritten; the diag bridge no longer binds over another app's port |
 | 1.14.0 | Diagnostic bridge for external inspection |
 | 1.13.0 | Deterministic classification; `purchase_order` and `transactional`; Reclassify Pending |
 | 1.12.x | `needs_input` flag + tab; AI Review Queue with cancel; one row, one tab |

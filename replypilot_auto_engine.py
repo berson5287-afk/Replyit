@@ -19,7 +19,9 @@
 # Every send then waits auto_send_delay_sec — the undo window. Opening the
 # item's review or deleting it cancels the scheduled send.
 
-ENGINE_VERSION = "1.2.0"  # v1.2.0: per-category opt-in, delay in minutes,
+ENGINE_VERSION = "1.3.0"  # v1.3.0: releases dripped one at a time rather
+                          # than swept, so a backlog cannot leave at once
+                          # v1.2.0: per-category opt-in, delay in minutes,
                           # inspectable queue for the Auto-Send tab
                           # v1.1.0: needs_input is a hard auto-send block
 

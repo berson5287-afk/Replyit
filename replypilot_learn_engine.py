@@ -24,7 +24,10 @@
 #   - Pure forwards with no typed reply (and signature-only sends) exist and
 #     carry no phrasing signal; they are excluded as unusable.
 
-ENGINE_VERSION = "1.3.0"  # v1.3.0: quote_in_process on the reply side
+ENGINE_VERSION = "1.7.0"  # v1.7.0: Confirm refuses rows the importer never
+#         classified; outbound vendor asks caught; line wrapping folded
+#         before phrase matching; duplicate _R_OUTBOUND_RE removed
+# v1.3.0: quote_in_process on the reply side
 # v1.2.0: second production retune — quote-delivery outranks decline clauses,
 #         "but we can supply" withdraws a decline, outbound stock-checks,
 #         wider commitment phrasing, stable fallback stage_id
