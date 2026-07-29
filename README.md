@@ -161,6 +161,29 @@ does not mean zero — `MIN_DELAY_SEC` still applies. Every gate is re-checked a
 the moment of firing, and removing the window entirely would remove the only
 chance to stop a wrong reply.
 
+### The drip
+
+The hold decides **when** a reply may go. The drip decides **how fast** replies
+are actually released: one per interval (default 60s), never a sweep — the same
+shape as the MaINbox triage drip.
+
+Without it, `evaluate_and_schedule()` gives every newly eligible row the *same*
+`fire_at`, so a category graduating against a backlog put the whole backlog on
+one countdown and fired it together. On a real queue that was 138 replies
+leaving in one instant, with no gap in which to notice the first was wrong. A
+per-item hold is an undo window, not a rate limit; it says nothing about how
+many land at once.
+
+With the drip on, a wrong rule costs one email and the time to spot it rather
+than the whole queue. Rows whose hold has expired but whose turn has not come
+stay in `scheduled` — still listed on the Auto-Send tab, still cancellable, and
+shown as **due** rather than "sending", because telling you ten replies are
+sending when nine are queued behind a drip would misreport the one thing that
+tab exists to show.
+
+Turning the drip off restores the old sweep, which is occasionally what you
+want on a small, trusted category.
+
 ## Auto-refresh
 
 The selected mailboxes are rescanned on a timer (default 90s, minimum 15,
@@ -391,6 +414,7 @@ one test reply to yourself — before trusting them.
 
 | Version | Change |
 |---|---|
+| 1.21.0 | Auto-sends are dripped one at a time instead of firing as a burst |
 | 1.20.0 | Configurable graduation bar with a live preview of what it would release; timeouts no longer cool an endpoint like a crash |
 | 1.19.0 | Auto-Send tab with live countdown; per-category auto-send opt-in; hold window in minutes; timed auto-refresh |
 | 1.18.0 | Templates rewritten to the user's measured voice; `VOICE_PROFILE` applied to every polish; invented-commitment guard; role addresses get no first name |

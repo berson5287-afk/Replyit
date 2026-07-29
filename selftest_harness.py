@@ -1320,7 +1320,7 @@ check("Auto-Send leads: what is about to leave is seen first",
 # the countdown the Auto-Send tab renders
 check("countdown formats seconds under a minute", _app._fmt_countdown(45) == "45s")
 check("countdown formats minutes:seconds", _app._fmt_countdown(125) == "2:05")
-check("countdown says sending at zero", _app._fmt_countdown(0) == "sending…")
+check("countdown says due at zero, not sending", _app._fmt_countdown(0) == "due")
 check("countdown tolerates rubbish", _app._fmt_countdown(None) == "")
 for _fn in ("ai_run_auto", "ai_run_local", "ai_run_host", "ai_cancel_run",
             "ai_remove_selected", "ai_clear_queue", "bulk_needs_input"):

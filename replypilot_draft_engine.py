@@ -59,6 +59,10 @@ DEFAULT_SETTINGS = {
     # an existing install is unchanged. Floors are enforced in RecordStore.
     "graduation_min_samples": 50,
     "graduation_min_agreement": 0.95,
+    # v1.13.0: releases are dripped one at a time rather than swept, so a
+    # backlog cannot leave in a single burst. See AutoSendEngine.due().
+    "auto_send_drip_enabled": True,
+    "auto_send_drip_sec": 60,
     # v1.6.0: let Outlook attach the real signature (with images) on send
     "use_outlook_signature": True,
 }

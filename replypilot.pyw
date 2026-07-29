@@ -444,13 +444,19 @@ def _pick_category(app, parent=None):
 
 
 def _fmt_countdown(secs):
-    """Seconds as m:ss, or 'sending…' once it has run out."""
+    """Seconds as m:ss, or 'due' once the hold has run out.
+
+    Deliberately not "sending…": with the drip on, several rows can sit at
+    zero while only one is released per interval, and telling the user that
+    ten replies are sending when nine are queued behind a drip would be a lie
+    about the one thing this tab exists to show.
+    """
     try:
         secs = int(secs)
     except (TypeError, ValueError):
         return ""
     if secs <= 0:
-        return "sending…"
+        return "due"
     if secs < 60:
         return "%ds" % secs
     return "%d:%02d" % (secs // 60, secs % 60)
@@ -1379,9 +1385,17 @@ class ReplyPilotApp:
             self._refresh_lists()
         if n:
             secs = self.auto.next_fire_in()
+            drip = self.auto.next_drip_in()
+            # report whichever gate is actually holding the next send, so the
+            # countdown on screen is the one the user is waiting on
+            wait = max(secs, drip)
+            note = ""
+            if drip > secs and n > 1:
+                note = " (dripping 1 per %ds)" % self.auto.drip_sec()
             self._set_status(
-                "%d auto-send(s) scheduled — next in %ds. "
-                "Open or Delete an email to cancel its send." % (n, secs))
+                "%d auto-send(s) queued — next in %ds%s. "
+                "Open or Delete an email to cancel its send."
+                % (n, wait, note))
         self._auto_refresh_tick()
 
     def _auto_refresh_tick(self):
@@ -1935,6 +1949,21 @@ class ReplyPilotApp:
         tk.Label(row1, text="queued replies appear on the Auto-Send tab "
                  "with a countdown", bg=_BG, fg=_FG_DIM,
                  font=(_FONT, _FONT_SZ)).pack(side="left")
+        drip_on_var = tk.BooleanVar(
+            value=bool(self.settings.get("auto_send_drip_enabled", True)))
+        ttk.Checkbutton(
+            f, text="Drip sends — release one at a time, never a burst",
+            variable=drip_on_var).pack(anchor="w", pady=(6, 0))
+        rowd = tk.Frame(f, bg=_BG); rowd.pack(fill="x", pady=(2, 0))
+        tk.Label(rowd, text="       One send every (seconds):", bg=_BG,
+                 fg=_FG, font=(_FONT, _FONT_SZ)).pack(side="left")
+        drip_var = tk.StringVar(
+            value=str(self.settings.get("auto_send_drip_sec", 60)))
+        _entry(rowd, drip_var, 6).pack(side="left", padx=6)
+        tk.Label(rowd, text="the hold decides WHEN a reply may go; this "
+                 "decides HOW FAST", bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+
         row2 = tk.Frame(f, bg=_BG); row2.pack(fill="x", pady=(6, 0))
         tk.Label(row2, text="Minimum AI confidence (0.0–1.0):", bg=_BG,
                  fg=_FG, font=(_FONT, _FONT_SZ)).pack(side="left")
@@ -2535,6 +2564,7 @@ class ReplyPilotApp:
                 delay_min = max(0.0, float(delay_var.get().strip()))
                 conf = min(1.0, max(0.0, float(conf_var.get().strip())))
                 refresh = max(15, int(refresh_var.get().strip()))
+                drip = max(auto.MIN_DRIP_SEC, int(drip_var.get().strip()))
             except ValueError:
                 messagebox.showerror(APP_TITLE,
                                      "Hold time and refresh interval must be "
@@ -2550,6 +2580,8 @@ class ReplyPilotApp:
             self.settings["auto_send_min_conf"] = conf
             self.settings["auto_refresh_enabled"] = refresh_on_var.get()
             self.settings["auto_refresh_sec"] = refresh
+            self.settings["auto_send_drip_enabled"] = drip_on_var.get()
+            self.settings["auto_send_drip_sec"] = drip
             # graduation bar — store the CLAMPED values, so what is saved is
             # what is actually in force rather than what was typed
             gn, ga = self.store.set_graduation(grad_n_var.get(),

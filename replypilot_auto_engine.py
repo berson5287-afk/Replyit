@@ -34,6 +34,20 @@ NEVER_AUTO = (clf.CAT_ESCALATE, clf.CAT_NO_REPLY)
 # The undo window never closes completely, even with the delay switched off.
 MIN_DELAY_SEC = 5
 
+# v1.3.0: releases are dripped, one per interval, never swept.
+#
+# evaluate_and_schedule() gives every newly eligible row the SAME fire_at, so
+# a category graduating against a backlog put the whole backlog on one
+# countdown and fired it in a single burst — 138 replies leaving together, no
+# gap in which to notice the first was wrong. The per-item hold is an undo
+# window, not a rate limit; it does nothing about how many land at once.
+#
+# Same shape as the MaINbox triage drip: one item per tick, deliberately never
+# a sweep. The hold still decides when a reply becomes *sendable*; the drip
+# decides how fast sendable replies are actually released, so a wrong rule
+# costs one email and the time to spot it rather than the whole queue.
+MIN_DRIP_SEC = 5
+
 
 class AutoSendEngine:
     def __init__(self, store, settings):
@@ -75,6 +89,33 @@ class AutoSendEngine:
 
     def delay_enabled(self):
         return bool(self.settings.get("auto_send_delay_enabled", True))
+
+    def drip_enabled(self):
+        return bool(self.settings.get("auto_send_drip_enabled", True))
+
+    def drip_sec(self):
+        """Minimum gap between two auto-sends."""
+        try:
+            return max(MIN_DRIP_SEC,
+                       int(float(self.settings.get("auto_send_drip_sec", 60))))
+        except (TypeError, ValueError):
+            return 60
+
+    def next_drip_in(self, now=None):
+        """Seconds until the drip will release the next send, or 0.
+
+        A last-send timestamp in the future means the clock moved backwards —
+        an NTP correction, or a daylight-saving jump. Waiting out that gap
+        would wedge the queue for as long as the clock skewed, so a negative
+        elapsed is treated as "no wait" rather than a very long one.
+        """
+        if not (self.drip_enabled() and self.sent_log):
+            return 0
+        now = now if now is not None else time.time()
+        elapsed = now - self.sent_log[-1][1]
+        if elapsed < 0:
+            return 0
+        return max(0, int(round(self.drip_sec() - elapsed)))
 
     def allowed_categories(self):
         """Categories the user has opted in to, or None for 'no restriction'.
@@ -159,18 +200,34 @@ class AutoSendEngine:
     def due(self, now=None):
         """Pop and return message_ids whose delay has elapsed AND that are
         still pending and still eligible (re-verified at fire time — the
-        user may have decided or deleted them during the delay window)."""
+        user may have decided or deleted them during the delay window).
+
+        v1.3.0: with the drip on, this releases at most ONE per call and only
+        once drip_sec has passed since the last send. Items whose hold has
+        expired but whose turn has not come stay in `scheduled`, so they
+        remain visible on the Auto-Send tab and remain cancellable — the old
+        code deleted every expired item in one pass, which is what turned a
+        backlog into a single burst.
+        """
         now = now if now is not None else time.time()
-        fired = [m for m, t in self.scheduled.items() if t <= now]
-        out = []
+        if not self.scheduled:
+            return []
+        if self.drip_enabled() and self.next_drip_in(now) > 0:
+            return []
+        # oldest hold first, so the queue drains in the order it formed
+        fired = sorted((t, m) for m, t in self.scheduled.items() if t <= now)
         if not fired:
-            return out
+            return []
         eligible_now = {r["message_id"] for r in self.eligible_rows()}
-        for mid in fired:
+        out = []
+        for _t, mid in fired:
             del self.scheduled[mid]
-            if mid in eligible_now:
-                out.append(mid)
-                self.sent_log.append((mid, now))
+            if mid not in eligible_now:
+                continue        # decided or deleted while it waited; drop it
+            out.append(mid)
+            self.sent_log.append((mid, now))
+            if self.drip_enabled():
+                break           # one per tick — never a sweep
         return out
 
     def queued_rows(self, now=None):
