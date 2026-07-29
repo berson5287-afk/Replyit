@@ -29,7 +29,9 @@ import os
 import re
 import json
 import time
+import socket
 import urllib.request
+import urllib.error
 
 # ------------------------------------------------------------------- taxonomy
 CAT_QUOTE_ACK = "quote_ack"    # RFQ received -> "I'll get back to you shortly"
@@ -537,11 +539,46 @@ _LLM_SYSTEM = (
 # reconfiguration cannot inherit a stale verdict.
 ENDPOINT_COOLDOWN_SEC = int(os.environ.get("REPLYPILOT_ENDPOINT_COOLDOWN",
                                            "300"))
+
+# v1.12.0: a timeout is not the same failure as a crash, and must not be
+# punished like one.
+#
+# Ollama unloads an idle model and reloads it on the next call. That reload can
+# take longer than the request timeout, so the first call after an idle period
+# times out — through no fault of the endpoint. Under a single cooldown that
+# one slow call sidelined the ONLY working endpoint for five minutes, and
+# classification silently dropped to heuristics for every email in that window.
+# Observed exactly that: nine test emails in a row came back source=heuristic
+# while the model was perfectly healthy and answering in 5s once warm.
+#
+# A CUDA fault or a missing model is persistent and deserves the long cooldown.
+# A timeout is transient and self-resolving, so it gets a short one — long
+# enough not to hammer a loading model, short enough that the endpoint is back
+# in play as soon as it is warm.
+ENDPOINT_TIMEOUT_COOLDOWN_SEC = int(
+    os.environ.get("REPLYPILOT_ENDPOINT_TIMEOUT_COOLDOWN", "20"))
+
 _endpoint_down_until = {}
 
 
 def _cooldown_key(host, port):
     return "%s:%d" % (host, port)
+
+
+def is_transient_error(exc):
+    """True for a timeout — slow, not broken.
+
+    HTTPError is checked first because it subclasses URLError: a 404 for a
+    missing model or a 500 from a crashed llama-server is a hard failure that
+    happens to arrive through the same exception hierarchy.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (socket.timeout, TimeoutError))
+    return False
 
 
 def endpoint_cooling(host, port, now=None):
@@ -550,9 +587,10 @@ def endpoint_cooling(host, port, now=None):
     return until > (now if now is not None else time.time())
 
 
-def mark_endpoint_down(host, port, now=None):
+def mark_endpoint_down(host, port, now=None, transient=False):
     now = now if now is not None else time.time()
-    _endpoint_down_until[_cooldown_key(host, port)] = now + ENDPOINT_COOLDOWN_SEC
+    secs = ENDPOINT_TIMEOUT_COOLDOWN_SEC if transient else ENDPOINT_COOLDOWN_SEC
+    _endpoint_down_until[_cooldown_key(host, port)] = now + secs
 
 
 def mark_endpoint_up(host, port):
@@ -615,7 +653,8 @@ def ollama_call(messages, fmt=None, timeout=None, probe=True,
             return ((data.get("message") or {}).get("content", ""), label)
         except Exception as e:
             last_reason = "error:%s" % e.__class__.__name__
-            mark_endpoint_down(host, port)
+            mark_endpoint_down(host, port,
+                               transient=is_transient_error(e))
             continue  # fall through to next endpoint (host busy -> local)
     if not tried_any and cooling:
         # everything is cooling; say so rather than claiming nothing is
