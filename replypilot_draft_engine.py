@@ -326,9 +326,13 @@ def greeting_for(sender_name="", sender_addr="", now=None):
     """
     first = _first_name(sender_name, sender_addr)
     hour = (now or datetime.datetime.now()).hour
-    part = ("Good morning" if hour < 12
-            else "Good afternoon" if hour < 17
-            else "Good evening")
+    # Two halves, split at noon. "Good evening" was in here on my assumption
+    # and is now gone: across 30 greetings in the confirmed corpus he writes
+    # "Good morning" 14 times and "Good afternoon" 12, and "Good evening"
+    # exactly never. A reply drafted at 6pm is still read the next morning,
+    # and greeting someone "Good evening" when they never do would be a
+    # tell that the mail was not written by him.
+    part = "Good morning" if hour < 12 else "Good afternoon"
     return "%s %s," % (part, first) if first else "%s," % part
 
 
@@ -558,12 +562,17 @@ def _voice_safety_check(text, template_text, examples):
 
 
 def _repair_greeting(text, template_text):
-    """Force the greeting back to the template's addressee.
+    """Force the whole greeting line back to the template's.
 
-    The name is not the model's to choose — render_template already resolved
-    it from the actual sender. When an exemplar's name wins instead, the reply
-    opens by calling the customer someone else, so this is repaired rather
-    than rejected: the rest of the draft is usually fine.
+    Neither half of it is the model's to choose. render_template resolved the
+    name from the actual sender and the time of day from the actual clock, so
+    a model that writes "Good afternoon" onto a draft composed at 9am is
+    simply wrong, in a way the reader notices immediately. Repaired rather
+    than rejected, because the rest of the draft is usually fine.
+
+    Replacing the entire matched greeting rather than just the name is what
+    makes the time of day stick — an earlier version fixed only the addressee
+    and let "Good morning" drift to "Good afternoon" unchallenged.
     """
     want = _GREETING_RE.match(template_text or "")
     got = _GREETING_RE.match(text or "")
@@ -572,8 +581,8 @@ def _repair_greeting(text, template_text):
     if not want:
         # template greeted no one by name; drop a name the model invented
         return text[:got.start(1)] + text[got.end(1):].lstrip()
-    if got.group(1).lower() != want.group(1).lower():
-        return text[:got.start(1)] + want.group(1) + text[got.end(1):]
+    if got.group(0).strip().lower() != want.group(0).strip().lower():
+        return want.group(0) + text[got.end(0):]
     return text
 
 

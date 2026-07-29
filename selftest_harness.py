@@ -1321,6 +1321,22 @@ check("Auto-Send leads: what is about to leave is seen first",
 check("countdown formats seconds under a minute", _app._fmt_countdown(45) == "45s")
 check("countdown formats minutes:seconds", _app._fmt_countdown(125) == "2:05")
 check("countdown says due at zero, not sending", _app._fmt_countdown(0) == "due")
+# greeting: two halves split at noon, and the model cannot move it
+import datetime as _dt
+_gr = lambda h: drafts.greeting_for("Roger", "r@x.com", now=_dt.datetime(2026, 7, 29, h, 0))
+check("before noon greets Good morning", _gr(9) == "Good morning Roger,", _gr(9))
+check("11:59 is still morning",
+      drafts.greeting_for("R", "r@x.com", now=_dt.datetime(2026, 7, 29, 11, 59)).startswith("Good morning"))
+check("noon flips to Good afternoon", _gr(12) == "Good afternoon Roger,", _gr(12))
+check("evening stays afternoon (never used in the corpus)", _gr(19) == "Good afternoon Roger,", _gr(19))
+check("no hour produces Good evening",
+      all("evening" not in _gr(h) for h in range(24)))
+_tpl_g = "Good morning Roger,\n\nWill advise. Thanks!\n\nSteve Berson"
+for _bad in ("Good afternoon Roger,", "Good morning Barry,",
+             "Good afternoon Barry,", "Hi Roger,"):
+    _out = drafts._repair_greeting(_bad + "\n\nWill advise.\n\nSteve Berson", _tpl_g)
+    check("greeting repaired: %s" % _bad,
+          _out.splitlines()[0] == "Good morning Roger,", _out.splitlines()[0])
 check("countdown tolerates rubbish", _app._fmt_countdown(None) == "")
 for _fn in ("ai_run_auto", "ai_run_local", "ai_run_host", "ai_cancel_run",
             "ai_remove_selected", "ai_clear_queue", "bulk_needs_input"):
