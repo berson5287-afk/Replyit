@@ -155,9 +155,16 @@ Everything scheduled to send waits on the first tab, with a live countdown, so
 what is about to leave the building is the first thing visible rather than
 something you go looking for. Opening or deleting a row cancels its send.
 
-Double-click a queued row to read and edit it, exactly as on any other tab — a
-reply about to go out unattended is the one most worth being able to change
-first. Opening **cancels the scheduled send before the window appears**, which
+The tab **flashes yellow** when something new lands there, because a reply that
+will leave on a timer should not arrive quietly. It only flashes on arrival — a
+falling count means something sent or was cancelled — and not while that tab is
+already on screen, since there is nobody to attract. (ttk tab options have no
+background colour, so the yellow arrives as a small `PhotoImage` toggled on and
+off.)
+
+`Delete` works here exactly as on Auto-Reply, and double-clicking a queued row
+opens it to read and edit, exactly as on any other tab — a reply about to go out
+unattended is the one most worth being able to change first. Opening **cancels the scheduled send before the window appears**, which
 is the only safe order: editing a draft while its countdown runs would race the
 send, and the row could leave mid-edit.
 

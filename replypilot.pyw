@@ -669,6 +669,16 @@ class ReplyPilotApp:
         self.tree_deleted  = self._make_tree(deleted=True)
         self.tree_done     = self._make_tree(done=True)
 
+        # v1.15.0: a yellow block used to flash the Auto-Send tab when
+        # something new lands there. ttk tab options do not include a
+        # background, so the colour has to arrive as an image — a 12x12
+        # PhotoImage filled yellow, toggled on and off. Held on self because a
+        # PhotoImage that goes out of scope is garbage collected and silently
+        # renders as nothing.
+        self._flash_img = tk.PhotoImage(width=12, height=12)
+        self._flash_img.put("#ffd21e", to=(0, 0, 12, 12))
+        self._flash_left = 0
+
         self.nb.add(self.tree_autosend.master, text="Auto-Send (0)")
         self.nb.add(self.tree_queue.master,    text="Auto-Reply Queue (0)")
         self.nb.add(self.tree_input.master,    text="Needs Your Input (0)")
@@ -1392,13 +1402,18 @@ class ReplyPilotApp:
                 self._refresh_lists()   # row appeared since the last fill
                 break
         n = self.auto.pending_count()
-        if n != getattr(self, "_last_queued_n", None):
+        prev = getattr(self, "_last_queued_n", None)
+        if n != prev:
             self._last_queued_n = n
             try:
                 self.nb.tab(_TAB_AUTOSEND, text="Auto-Send (%d)" % n)
             except Exception:
                 pass
             self._refresh_lists()
+            # only on arrival: a count that fell means something sent or was
+            # cancelled, and flashing at that would be noise
+            if prev is not None and n > prev:
+                self._flash_autosend()
         if n:
             secs = self.auto.next_fire_in()
             drip = self.auto.next_drip_in()
@@ -1442,6 +1457,41 @@ class ReplyPilotApp:
 
     def _set_status(self, msg):
         self.status_var.set(msg)
+
+    def _flash_autosend(self, cycles=8):
+        """Blink the Auto-Send tab so a new queued reply is noticed.
+
+        Something that will leave the building on a timer should not arrive
+        quietly. Skipped when that tab is already on screen — the user is
+        looking at it, so there is nothing to attract them to.
+        """
+        try:
+            if self.nb.index(self.nb.select()) == _TAB_AUTOSEND:
+                return
+        except Exception:
+            pass
+        restart = self._flash_left <= 0
+        self._flash_left = max(self._flash_left, cycles)
+        if restart:
+            self._flash_step()
+
+    def _flash_step(self):
+        on = self._flash_left % 2 == 0
+        self._flash_left -= 1
+        try:
+            if self._flash_left < 0 or \
+                    self.nb.index(self.nb.select()) == _TAB_AUTOSEND:
+                # done, or the user has looked — clear the marker
+                self._flash_left = 0
+                self.nb.tab(_TAB_AUTOSEND, image="", compound="none")
+                return
+            self.nb.tab(_TAB_AUTOSEND,
+                        image=(self._flash_img if on else ""),
+                        compound=("left" if on else "none"))
+        except Exception:
+            self._flash_left = 0
+            return
+        self.root.after(450, self._flash_step)
 
     def _voice_for(self, category):
         """The user's own confirmed replies for a category, as style examples.
@@ -1838,7 +1888,18 @@ class ReplyPilotApp:
                                         clf.LOCAL_OLLAMA_HOST,
                                         clf.LOCAL_OLLAMA_PORT)))
                     return
-                where = "tillium (host)" if label == "host" else "local Ollama"
+                # Report the endpoint the USER picked, not the positional
+                # label. "Run on local" rewrites both entries to the local
+                # host, so active_endpoint_label() answers "host" — it means
+                # "the first one configured", not "the remote machine" — and
+                # the status then claimed a run was on the host while it was
+                # running locally. Only auto mode has to ask.
+                if endpoint == "local":
+                    where = "Local AI"
+                elif endpoint == "host":
+                    where = "Host AI"
+                else:
+                    where = "Host AI" if label == "host" else "Local AI"
                 improved, reasons, err, cancelled = 0, {}, None, 0
                 try:
                     for i, row in enumerate(rows, 1):
@@ -2173,8 +2234,10 @@ class ReplyPilotApp:
         cur_ai.update({k: self.settings[k] for k in clf.AI_SETTINGS_KEYS
                        if k in self.settings})
 
-        fh = ttk.LabelFrame(t3, text="Host (tillium-bridge — tried first)",
-                            padding=8)
+        # No machine name in the label: it is whatever host is configured
+        # below, and hard-coding one particular box's name made the panel lie
+        # as soon as that field changed.
+        fh = ttk.LabelFrame(t3, text="Host AI (tried first)", padding=8)
         fh.pack(fill="x", padx=10, pady=(10, 4))
         ai_host_var = tk.StringVar(value=str(cur_ai["ai_host"]))
         ai_port_var = tk.StringVar(value=str(cur_ai["ai_port"]))
