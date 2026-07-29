@@ -1310,10 +1310,18 @@ check("migration adds needs_input to a pre-v1.4 DB",
 check("existing rows default to not-flagged", _om.get("<pre@x>")["needs_input"] == 0)
 _om.close()
 
-# tab indices stay consistent with the six-tab layout
+# tab indices stay consistent with the seven-tab layout
 check("tab indices distinct and ordered",
-      [_app._TAB_QUEUE, _app._TAB_INPUT, _app._TAB_AIREVIEW,
-       _app._TAB_NOREPLY, _app._TAB_DELETED, _app._TAB_DECIDED] == [0, 1, 2, 3, 4, 5])
+      [_app._TAB_AUTOSEND, _app._TAB_QUEUE, _app._TAB_INPUT,
+       _app._TAB_AIREVIEW, _app._TAB_NOREPLY, _app._TAB_DELETED,
+       _app._TAB_DECIDED] == [0, 1, 2, 3, 4, 5, 6])
+check("Auto-Send leads: what is about to leave is seen first",
+      _app._TAB_AUTOSEND == 0)
+# the countdown the Auto-Send tab renders
+check("countdown formats seconds under a minute", _app._fmt_countdown(45) == "45s")
+check("countdown formats minutes:seconds", _app._fmt_countdown(125) == "2:05")
+check("countdown says sending at zero", _app._fmt_countdown(0) == "sending…")
+check("countdown tolerates rubbish", _app._fmt_countdown(None) == "")
 for _fn in ("ai_run_auto", "ai_run_local", "ai_run_host", "ai_cancel_run",
             "ai_remove_selected", "ai_clear_queue", "bulk_needs_input"):
     check("app exposes %s" % _fn, callable(getattr(_app.ReplyPilotApp, _fn, None)))

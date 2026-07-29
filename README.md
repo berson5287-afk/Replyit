@@ -60,6 +60,7 @@ byte would destroy the configuration permanently.
 Import `.eml` files, or scan selected Outlook folders. New mail is classified
 and lands in one of several tabs:
 
+- **Auto-Send** — scheduled to send, counting down; open or delete to cancel
 - **Auto-Reply Queue** — needs a reply, ready to review
 - **Needs Your Input** — asks something only you know ("who's the
   competition?"). Never auto-sends, whatever its category
@@ -107,15 +108,43 @@ window shows the numbers; double-click a row to force a manual override.
 Auto-send fires only when every gate passes:
 
 1. Master switch on in Settings (off by default)
-2. Category graduated, or manually overridden
-3. Category is not `escalate` or `no_reply` — hard-excluded regardless
-4. Row is not flagged `needs_input` — hard-excluded regardless
-5. Confidence ≥ the configured threshold
-6. A non-empty draft exists
-7. Still pending at both schedule time **and** fire time
+2. Category ticked in **Settings → Auto-send → Reply types**
+3. Category graduated, or manually overridden
+4. Category is not `escalate` or `no_reply` — hard-excluded regardless
+5. Row is not flagged `needs_input` — hard-excluded regardless
+6. Confidence ≥ the configured threshold
+7. A non-empty draft exists
+8. Still pending at both schedule time **and** fire time
 
-Every send then waits a delay window. Opening or deleting the email cancels
-it, and eligibility is re-checked at the moment of firing.
+Gate 2 only ever **narrows**. Ticking a reply type is a preference; graduation
+is evidence, and it is the evidence that makes sending safe — so a ticked type
+that has not graduated still sends nothing. Leaving every type ticked stores no
+restriction at all, which is how an existing settings file behaves. Unticking
+even one writes an explicit list, and an empty list means nothing sends.
+
+`escalate` and `no_reply` are not offered in that list, because no amount of
+ticking could make them eligible.
+
+## The Auto-Send tab
+
+Everything scheduled to send waits on the first tab, with a live countdown, so
+what is about to leave the building is the first thing visible rather than
+something you go looking for. Opening or deleting a row cancels its send.
+
+The hold is set in minutes (**Settings → Auto-send**), because a window you
+would actually use to catch a bad reply is minutes long. Switching the hold off
+does not mean zero — `MIN_DELAY_SEC` still applies. Every gate is re-checked at
+the moment of firing, and removing the window entirely would remove the only
+chance to stop a wrong reply.
+
+## Auto-refresh
+
+The selected mailboxes are rescanned on a timer (default 90s, minimum 15,
+**Settings → Auto-send → Auto-refresh**). A scan already in progress is never
+interrupted and no second scan is queued behind it: with draft polish on, one
+pass over a full folder can outlast the interval, and queuing would mean the
+app never stopped scanning. The timer path raises no dialogs, since an
+unattended timer must not put a modal in front of you.
 
 ## Learn from Sent
 
@@ -338,6 +367,7 @@ one test reply to yourself — before trusting them.
 
 | Version | Change |
 |---|---|
+| 1.19.0 | Auto-Send tab with live countdown; per-category auto-send opt-in; hold window in minutes; timed auto-refresh |
 | 1.18.0 | Templates rewritten to the user's measured voice; `VOICE_PROFILE` applied to every polish; invented-commitment guard; role addresses get no first name |
 | 1.17.0 | Endpoint cooldown so a broken host costs one call, not every call; settings survive a BOM and are quarantined rather than overwritten |
 | 1.16.0 | Drafts written in the user's voice from confirmed replies, with fact-leak validation; outbound vendor asks excluded from learning |

@@ -19,7 +19,9 @@
 # Every send then waits auto_send_delay_sec — the undo window. Opening the
 # item's review or deleting it cancels the scheduled send.
 
-ENGINE_VERSION = "1.1.0"  # v1.1.0: needs_input is a hard auto-send block
+ENGINE_VERSION = "1.2.0"  # v1.2.0: per-category opt-in, delay in minutes,
+                          # inspectable queue for the Auto-Send tab
+                          # v1.1.0: needs_input is a hard auto-send block
 
 import time
 
@@ -28,6 +30,9 @@ import replypilot_record_engine as rec
 
 # Hard exclusions — never auto-sendable regardless of graduation/override
 NEVER_AUTO = (clf.CAT_ESCALATE, clf.CAT_NO_REPLY)
+
+# The undo window never closes completely, even with the delay switched off.
+MIN_DELAY_SEC = 5
 
 
 class AutoSendEngine:
@@ -42,10 +47,47 @@ class AutoSendEngine:
         return bool(self.settings.get("auto_send_master", False))
 
     def delay_sec(self):
+        """The undo window, in seconds.
+
+        v1.2.0: the UI works in minutes, because a delay you would actually
+        use to catch a bad reply is minutes long, not seconds. Stored as
+        auto_send_delay_min; auto_send_delay_sec is still read so an existing
+        settings file keeps its configured window.
+
+        Turning the delay off does not mean zero. MIN_DELAY_SEC still applies:
+        every gate is re-checked at fire time, so a row that is opened or
+        deleted in that window is caught, and removing the window entirely
+        would remove the only chance to stop a wrong reply.
+        """
+        if not self.delay_enabled():
+            return MIN_DELAY_SEC
+        mins = self.settings.get("auto_send_delay_min")
+        if mins is not None and str(mins).strip() != "":
+            try:
+                return max(MIN_DELAY_SEC, int(float(str(mins).strip()) * 60))
+            except (TypeError, ValueError):
+                pass
         try:
-            return max(5, int(self.settings.get("auto_send_delay_sec", 60)))
-        except Exception:
+            return max(MIN_DELAY_SEC,
+                       int(self.settings.get("auto_send_delay_sec", 60)))
+        except (TypeError, ValueError):
             return 60
+
+    def delay_enabled(self):
+        return bool(self.settings.get("auto_send_delay_enabled", True))
+
+    def allowed_categories(self):
+        """Categories the user has opted in to, or None for 'no restriction'.
+
+        A missing key means every category is permitted, so an existing
+        settings file behaves exactly as before. An explicit empty list means
+        the user has opted nothing in, and nothing sends — which is different
+        from 'not configured' and must not be collapsed into it.
+        """
+        v = self.settings.get("auto_send_categories")
+        if v is None:
+            return None
+        return {str(c) for c in v}
 
     def min_conf(self):
         try:
@@ -60,12 +102,20 @@ class AutoSendEngine:
             return []
         stats = self.store.category_stats()
         min_conf = self.min_conf()
+        allowed = self.allowed_categories()
         out = []
         for r in self.store.pending():
             cat = r.get("ai_category")
             if not r.get("ai_needs_reply"):
                 continue
             if cat in NEVER_AUTO:
+                continue
+            if allowed is not None and cat not in allowed:
+                # v1.2.0: the user's per-category opt-in. This only ever
+                # narrows — a category ticked here still has to graduate or
+                # be overridden below, because a tick is a preference and
+                # graduation is evidence, and the evidence is what makes
+                # sending safe.
                 continue
             if not stats.get(cat, {}).get("auto_send", False):
                 continue
@@ -121,6 +171,24 @@ class AutoSendEngine:
             if mid in eligible_now:
                 out.append(mid)
                 self.sent_log.append((mid, now))
+        return out
+
+    def queued_rows(self, now=None):
+        """[(row, seconds_remaining)] for everything waiting to send.
+
+        v1.2.0: the Auto-Send tab needs to show what is about to go out and
+        how long is left to stop it. Rows whose email has since vanished from
+        the store are dropped rather than shown as blanks — and their
+        schedule entry goes with them, since there is nothing left to send.
+        """
+        now = now if now is not None else time.time()
+        out = []
+        for mid, fire_at in sorted(self.scheduled.items(), key=lambda kv: kv[1]):
+            row = self.store.get(mid)
+            if row is None:
+                self.scheduled.pop(mid, None)
+                continue
+            out.append((row, max(0, int(round(fire_at - now)))))
         return out
 
     def pending_count(self):

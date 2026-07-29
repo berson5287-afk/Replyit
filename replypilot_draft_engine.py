@@ -44,6 +44,17 @@ DEFAULT_SETTINGS = {
     "auto_send_master": False,
     "auto_send_delay_sec": 60,
     "auto_send_min_conf": 0.85,
+    # v1.11.0: the undo window, expressed the way it is actually reasoned
+    # about. Off still leaves MIN_DELAY_SEC — see AutoSendEngine.delay_sec.
+    "auto_send_delay_enabled": True,
+    "auto_send_delay_min": 1,
+    # None means "no per-category restriction", which is what an existing
+    # settings file implies. An explicit [] means the user opted nothing in.
+    "auto_send_categories": None,
+    # v1.11.0: periodic rescan. Guarded by the busy flag, so a scan that runs
+    # long can never stack another on top of itself.
+    "auto_refresh_enabled": True,
+    "auto_refresh_sec": 90,
     # v1.6.0: let Outlook attach the real signature (with images) on send
     "use_outlook_signature": True,
 }

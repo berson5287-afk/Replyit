@@ -150,6 +150,7 @@ APP_TITLE = "Replyit v1.14.0"
 
 import os
 import re
+import time
 import threading
 import queue as _queue
 import tkinter as tk
@@ -265,12 +266,16 @@ CATEGORY_LABELS = {
 }
 
 # Tab indices
-_TAB_QUEUE    = 0
-_TAB_INPUT    = 1
-_TAB_AIREVIEW = 2
-_TAB_NOREPLY  = 3
-_TAB_DELETED  = 4
-_TAB_DECIDED  = 5
+# v1.15.0: Auto-Send leads, because it is the only tab whose contents leave
+# the building on a timer — what is about to be sent should be the first
+# thing visible, not something you go looking for.
+_TAB_AUTOSEND = 0
+_TAB_QUEUE    = 1
+_TAB_INPUT    = 2
+_TAB_AIREVIEW = 3
+_TAB_NOREPLY  = 4
+_TAB_DELETED  = 5
+_TAB_DECIDED  = 6
 
 # v1.3.0: toolbar manifest — single source of truth for every button.
 # (id, label, app method name). The saved layout in settings.json is a list
@@ -436,6 +441,19 @@ def _pick_category(app, parent=None):
     d.focus_set()
     parent.wait_window(d)
     return sel["cat"]
+
+
+def _fmt_countdown(secs):
+    """Seconds as m:ss, or 'sending…' once it has run out."""
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        return ""
+    if secs <= 0:
+        return "sending…"
+    if secs < 60:
+        return "%ds" % secs
+    return "%d:%02d" % (secs // 60, secs % 60)
 
 
 def partition_pending(pending, ai_queue_ids=()):
@@ -633,6 +651,7 @@ class ReplyPilotApp:
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=6, pady=(4, 0))
 
+        self.tree_autosend = self._make_tree(autosend=True)
         self.tree_queue    = self._make_tree(checks=True)
         self.tree_input    = self._make_tree(checks=True)
         self.tree_aireview = self._make_tree(ai_status=True)
@@ -640,6 +659,7 @@ class ReplyPilotApp:
         self.tree_deleted  = self._make_tree(deleted=True)
         self.tree_done     = self._make_tree(done=True)
 
+        self.nb.add(self.tree_autosend.master, text="Auto-Send (0)")
         self.nb.add(self.tree_queue.master,    text="Auto-Reply Queue (0)")
         self.nb.add(self.tree_input.master,    text="Needs Your Input (0)")
         self.nb.add(self.tree_aireview.master, text="AI Review Queue (0)")
@@ -777,13 +797,17 @@ class ReplyPilotApp:
                     btn.config(state="disabled", fg=_FG_DIM)
 
     def _make_tree(self, done=False, deleted=False, checks=False,
-                   ai_status=False):
+                   ai_status=False, autosend=False):
         frame = tk.Frame(self.nb, bg=_BG)
         cols = ("received", "sender", "subject", "category", "conf")
         heads = ("Received", "From", "Subject", "AI Category", "Conf")
         if checks:
             cols  = ("chk",) + cols
             heads = ("✓",) + heads
+        if autosend:
+            # leading, because the countdown is the reason to look at this tab
+            cols  = ("sends_in",) + cols
+            heads = ("Sends in",) + heads
         if done:
             cols  = cols  + ("action",)
             heads = heads + ("Decision",)
@@ -797,7 +821,7 @@ class ReplyPilotApp:
                             selectmode="extended")   # ← multi-select
         widths = {"chk": 34, "received": 140, "sender": 185, "subject": 300,
                   "category": 155, "conf": 50, "action": 110,
-                  "deleted_at": 130, "aistate": 110}
+                  "deleted_at": 130, "aistate": 110, "sends_in": 90}
         for c, h in zip(cols, heads):
             tree.heading(c, text=h)
             tree.column(c, width=widths.get(c, 100),
@@ -833,6 +857,9 @@ class ReplyPilotApp:
             done.extend(self.store.by_action(a))
         done.sort(key=lambda r: r.get("decided_at") or "", reverse=True)
 
+        queued = self.auto.queued_rows()
+        self._fill(self.tree_autosend, [r for r, _s in queued], autosend=True,
+                   countdown={r["message_id"]: s for r, s in queued})
         self._fill(self.tree_queue,    q_rows, checks=True)
         self._fill(self.tree_input,    input_rows, checks=True)
         self._fill(self.tree_aireview, ai_rows, ai_status=True)
@@ -844,6 +871,7 @@ class ReplyPilotApp:
         live = set(self.tree_queue.get_children()) \
             | set(self.tree_input.get_children())
         self.checked &= live
+        self.nb.tab(_TAB_AUTOSEND, text="Auto-Send (%d)" % len(queued))
         self.nb.tab(_TAB_QUEUE,   text="Auto-Reply Queue (%d)" % len(q_rows))
         self.nb.tab(_TAB_INPUT,   text="Needs Your Input (%d)"
                     % len(input_rows))
@@ -853,7 +881,7 @@ class ReplyPilotApp:
         self.nb.tab(_TAB_DECIDED, text="Decided (%d)" % len(done))
 
     def _fill(self, tree, rows, done=False, deleted=False, checks=False,
-              ai_status=False):
+              ai_status=False, autosend=False, countdown=None):
         tree.delete(*tree.get_children())
         for r in rows:
             vals = (r.get("received_at", "")[:16].replace("T", " "),
@@ -865,6 +893,9 @@ class ReplyPilotApp:
             if checks:
                 mark = "☑" if r["message_id"] in self.checked else "☐"
                 vals = (mark,) + vals
+            if autosend:
+                vals = (_fmt_countdown((countdown or {}).get(
+                    r["message_id"], 0)),) + vals
             if done:
                 vals = vals + (r.get("user_action", ""),)
             if deleted:
@@ -1158,9 +1189,12 @@ class ReplyPilotApp:
         if folder:
             self._ingest_async(lambda: mail.scan_eml_folder(folder))
 
-    def scan_outlook(self):
+    def scan_outlook(self, silent=False):
+        """silent=True is the auto-refresh path: no dialogs, because an
+        unattended timer must never put a modal in front of the user."""
         if not mail.COM_AVAILABLE:
-            messagebox.showinfo(APP_TITLE, "Outlook COM not available.")
+            if not silent:
+                messagebox.showinfo(APP_TITLE, "Outlook COM not available.")
             return
         # v1.9.0: scan the folders chosen in Settings -> Mailboxes.
         # Empty selection keeps the original behavior (default Inbox).
@@ -1322,12 +1356,55 @@ class ReplyPilotApp:
                                   row.get("ai_draft") or "")
             self._set_status("Auto-sent: %s" % (row.get("subject") or mid))
             self._refresh_lists()
+        # keep the Auto-Send tab's countdown live without redrawing every
+        # other tab on a 150ms tick
+        for row, secs in self.auto.queued_rows():
+            try:
+                self.tree_autosend.set(row["message_id"], "sends_in",
+                                       _fmt_countdown(secs))
+            except Exception:
+                self._refresh_lists()   # row appeared since the last fill
+                break
         n = self.auto.pending_count()
+        if n != getattr(self, "_last_queued_n", None):
+            self._last_queued_n = n
+            try:
+                self.nb.tab(_TAB_AUTOSEND, text="Auto-Send (%d)" % n)
+            except Exception:
+                pass
+            self._refresh_lists()
         if n:
             secs = self.auto.next_fire_in()
             self._set_status(
                 "%d auto-send(s) scheduled — next in %ds. "
                 "Open or Delete an email to cancel its send." % (n, secs))
+        self._auto_refresh_tick()
+
+    def _auto_refresh_tick(self):
+        """v1.15.0: rescan on a timer so new mail arrives without a click.
+
+        Skipped while busy rather than queued behind the current scan: with
+        draft polish on, one pass over a full folder can outlast the interval,
+        and a queued rescan would mean the app never stopped scanning.
+        """
+        if not self.settings.get("auto_refresh_enabled", True):
+            return
+        if self.busy or not mail.COM_AVAILABLE:
+            return
+        try:
+            every = max(15, int(self.settings.get("auto_refresh_sec", 90)))
+        except (TypeError, ValueError):
+            every = 90
+        now = time.time()
+        last = getattr(self, "_last_auto_refresh", None)
+        if last is None:
+            self._last_auto_refresh = now      # don't scan the instant we open
+            return
+        if now - last < every:
+            return
+        self._last_auto_refresh = now
+        self._set_status("Auto-refresh: checking for new mail…")
+        self.scan_outlook(silent=True)
 
     def _set_status(self, msg):
         self.status_var.set(msg)
@@ -1838,21 +1915,75 @@ class ReplyPilotApp:
         ttk.Checkbutton(
             f, text="Master auto-send ON (categories still need to be "
             "graduated or overridden)", variable=master_var).pack(anchor="w")
-        row1 = tk.Frame(f, bg=_BG); row1.pack(fill="x", pady=(6, 0))
-        tk.Label(row1, text="Delay / undo window (seconds):", bg=_BG,
+        delay_on_var = tk.BooleanVar(
+            value=bool(self.settings.get("auto_send_delay_enabled", True)))
+        ttk.Checkbutton(
+            f, text="Hold each reply before sending (undo window)",
+            variable=delay_on_var).pack(anchor="w", pady=(6, 0))
+        row1 = tk.Frame(f, bg=_BG); row1.pack(fill="x", pady=(2, 0))
+        tk.Label(row1, text="       Hold for (minutes):", bg=_BG,
                  fg=_FG, font=(_FONT, _FONT_SZ)).pack(side="left")
+        _legacy_min = round(
+            (self.settings.get("auto_send_delay_sec") or 60) / 60.0, 2)
         delay_var = tk.StringVar(
-            value=str(self.settings.get("auto_send_delay_sec", 60)))
+            value=str(self.settings.get("auto_send_delay_min", _legacy_min)))
         _entry(row1, delay_var, 6).pack(side="left", padx=6)
+        tk.Label(row1, text="queued replies appear on the Auto-Send tab "
+                 "with a countdown", bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
         row2 = tk.Frame(f, bg=_BG); row2.pack(fill="x", pady=(6, 0))
         tk.Label(row2, text="Minimum AI confidence (0.0–1.0):", bg=_BG,
                  fg=_FG, font=(_FONT, _FONT_SZ)).pack(side="left")
         conf_var = tk.StringVar(
             value=str(self.settings.get("auto_send_min_conf", 0.85)))
         _entry(row2, conf_var, 6).pack(side="left", padx=6)
-        tk.Label(f, text="Escalate and No-Reply are never auto-sent, "
-                 "regardless of settings.", bg=_BG, fg=_FG_DIM,
+
+        # ---- per-category opt-in ----------------------------------------
+        fc = ttk.LabelFrame(t1, text="Reply types allowed to auto-send",
+                            padding=8)
+        fc.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(fc, text="Ticking narrows what may send — it does not "
+                 "unlock anything. A ticked type still has to graduate "
+                 "(%d samples at %d%% agreement) or be overridden in Stats."
+                 % (rec.GRADUATION_MIN_SAMPLES,
+                    round(100 * rec.GRADUATION_MIN_AGREEMENT)),
+                 bg=_BG, fg=_FG_DIM, font=(_FONT, _FONT_SZ),
+                 justify="left", wraplength=520).pack(anchor="w",
+                                                      pady=(0, 6))
+        _saved_cats = self.settings.get("auto_send_categories")
+        cat_vars = {}
+        grid = tk.Frame(fc, bg=_BG); grid.pack(fill="x")
+        _sendable = [c for c in clf.REPLY_CATEGORIES
+                     if c not in auto.NEVER_AUTO]
+        for i, c in enumerate(_sendable):
+            v = tk.BooleanVar(
+                value=(True if _saved_cats is None else c in _saved_cats))
+            cat_vars[c] = v
+            ttk.Checkbutton(grid, text=CATEGORY_LABELS.get(c, c),
+                            variable=v).grid(row=i // 2, column=i % 2,
+                                             sticky="w", padx=(0, 18))
+        tk.Label(fc, text="Escalate and No-Reply are never auto-sent, "
+                 "regardless of settings, so they are not listed.",
+                 bg=_BG, fg=_FG_DIM,
                  font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(6, 0))
+
+        # ---- auto-refresh ------------------------------------------------
+        fr = ttk.LabelFrame(t1, text="Auto-refresh", padding=8)
+        fr.pack(fill="x", padx=10, pady=(0, 10))
+        refresh_on_var = tk.BooleanVar(
+            value=bool(self.settings.get("auto_refresh_enabled", True)))
+        ttk.Checkbutton(fr, text="Check the selected mailboxes "
+                        "automatically", variable=refresh_on_var
+                        ).pack(anchor="w")
+        row3 = tk.Frame(fr, bg=_BG); row3.pack(fill="x", pady=(4, 0))
+        tk.Label(row3, text="       Every (seconds):", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        refresh_var = tk.StringVar(
+            value=str(self.settings.get("auto_refresh_sec", 90)))
+        _entry(row3, refresh_var, 6).pack(side="left", padx=6)
+        tk.Label(row3, text="minimum 15; a scan already running is never "
+                 "interrupted", bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
 
         # ---------------- Tab 2: Drafting ---------------------------------
         t2 = tk.Frame(nb, bg=_BG); nb.add(t2, text="Drafting")
@@ -2340,16 +2471,29 @@ class ReplyPilotApp:
         # ---------------- shared Save / Cancel ----------------------------
         def save():
             try:
-                delay = max(5, int(delay_var.get().strip()))
+                delay_min = max(0.0, float(delay_var.get().strip()))
                 conf = min(1.0, max(0.0, float(conf_var.get().strip())))
+                refresh = max(15, int(refresh_var.get().strip()))
             except ValueError:
                 messagebox.showerror(APP_TITLE,
-                                     "Delay must be an integer and "
-                                     "confidence a number.", parent=win)
+                                     "Hold time and refresh interval must be "
+                                     "numbers, and confidence a number "
+                                     "between 0 and 1.", parent=win)
                 return
             self.settings["auto_send_master"] = master_var.get()
-            self.settings["auto_send_delay_sec"] = delay
+            self.settings["auto_send_delay_enabled"] = delay_on_var.get()
+            self.settings["auto_send_delay_min"] = delay_min
+            # keep the legacy key in step so nothing reading it drifts
+            self.settings["auto_send_delay_sec"] = max(
+                auto.MIN_DELAY_SEC, int(delay_min * 60))
             self.settings["auto_send_min_conf"] = conf
+            self.settings["auto_refresh_enabled"] = refresh_on_var.get()
+            self.settings["auto_refresh_sec"] = refresh
+            # None (no restriction) only survives while every box is ticked;
+            # once the user unticks one this becomes an explicit list
+            _picked = [c for c, v in cat_vars.items() if v.get()]
+            self.settings["auto_send_categories"] = (
+                None if len(_picked) == len(cat_vars) else _picked)
             self.settings["use_llm_polish"] = polish_var.get()
             self.settings["use_outlook_signature"] = olsig_var.get()
             self.settings["signature"] = sig_txt.get("1.0", "end").strip()
