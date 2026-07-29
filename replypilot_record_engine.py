@@ -57,9 +57,21 @@ DECIDED_ACTIONS = (ACTION_ACCEPTED, ACTION_RECATEGORIZED, ACTION_EDITED,
                    ACTION_DECLINED, ACTION_MOVED_NO_REPLY, ACTION_AUTO_SENT,
                    ACTION_DELETED)
 
-# Graduation thresholds
+# Graduation thresholds — the DEFAULTS. A store can be given its own via
+# set_graduation(), because 50 at 95% is a judgement call rather than a law:
+# it suits a high-volume category and is unreachable for a rare one, and the
+# person carrying the risk of a wrong reply is the one who should be setting
+# the bar. Lowering it never bypasses the other gates — a category still has
+# to be ticked in Settings, be outside NEVER_AUTO, clear the confidence
+# threshold, and hold a draft.
 GRADUATION_MIN_SAMPLES = 50
 GRADUATION_MIN_AGREEMENT = 0.95
+
+# Floors that hold whatever the settings say. One sample is the least that can
+# be called evidence, and an agreement bar of zero would mean "graduate a
+# category you have never once agreed with", which is not a threshold at all.
+GRADUATION_FLOOR_SAMPLES = 1
+GRADUATION_FLOOR_AGREEMENT = 0.5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -106,6 +118,9 @@ class RecordStore:
         self.dir = directory or data_dir()
         self.db_path = os.path.join(self.dir, DB_NAME)
         self.audit_path = os.path.join(self.dir, AUDIT_NAME)
+        # per-store graduation bar; set_graduation() overrides from settings
+        self.min_samples = GRADUATION_MIN_SAMPLES
+        self.min_agreement = GRADUATION_MIN_AGREEMENT
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -374,6 +389,55 @@ class RecordStore:
             return set(r["message_id"] for r in cur.fetchall())
 
     # ------------------------------------------------------------ stats/gradu
+    def set_graduation(self, min_samples=None, min_agreement=None):
+        """Set this store's graduation bar, clamped to the floors.
+
+        Returns the (samples, agreement) actually in force, which is not
+        always what was asked for — a settings file can hold anything, and a
+        bar below the floors would let a category start replying to customers
+        on no evidence at all.
+        """
+        if min_samples is not None and str(min_samples).strip() != "":
+            try:
+                self.min_samples = max(GRADUATION_FLOOR_SAMPLES,
+                                       int(float(str(min_samples).strip())))
+            except (TypeError, ValueError):
+                pass
+        if min_agreement is not None and str(min_agreement).strip() != "":
+            try:
+                v = float(str(min_agreement).strip())
+                if v > 1:            # tolerate 95 meaning 95%
+                    v = v / 100.0
+                self.min_agreement = min(1.0,
+                                         max(GRADUATION_FLOOR_AGREEMENT, v))
+            except (TypeError, ValueError):
+                pass
+        return self.min_samples, self.min_agreement
+
+    def graduation_preview(self, min_samples, min_agreement):
+        """Which categories WOULD graduate at a proposed bar.
+
+        The point of showing this before saving: a threshold is abstract, and
+        the thing the user actually needs to know is which reply types are
+        about to become sendable. NEVER_AUTO categories are still listed —
+        the auto-send engine excludes them separately, and hiding them here
+        would misrepresent what the number does.
+        """
+        try:
+            n_min = max(GRADUATION_FLOOR_SAMPLES,
+                        int(float(str(min_samples).strip())))
+            a_min = float(str(min_agreement).strip())
+            if a_min > 1:
+                a_min = a_min / 100.0
+            a_min = min(1.0, max(GRADUATION_FLOOR_AGREEMENT, a_min))
+        except (TypeError, ValueError):
+            return []
+        out = []
+        for cat, v in self.category_stats().items():
+            if v["samples"] >= n_min and v["agreement"] >= a_min:
+                out.append(cat)
+        return sorted(out)
+
     def category_stats(self):
         """Per AI-assigned category: decided sample count, unchanged count,
         agreement rate, graduation status."""
@@ -398,8 +462,8 @@ class RecordStore:
             n = r["n"]
             unchanged = r["unchanged"] or 0
             rate = (unchanged / n) if n else 0.0
-            graduated = (n >= GRADUATION_MIN_SAMPLES
-                         and rate >= GRADUATION_MIN_AGREEMENT)
+            graduated = (n >= self.min_samples
+                         and rate >= self.min_agreement)
             ov = overrides.get(cat)
             auto_send = graduated
             if ov and ov["manual_override"]:

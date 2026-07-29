@@ -389,11 +389,22 @@ class DiagBridge:
 
     def ep_stats(self, q):
         st = self.app.store
+        # the bar in force on THIS store, not the module defaults — they part
+        # company as soon as the user changes it in Settings
         return {"categories": st.category_stats(),
                 "origin": st.origin_counts(),
-                "graduation": {"min_samples": _rec().GRADUATION_MIN_SAMPLES,
-                               "min_agreement":
-                                   _rec().GRADUATION_MIN_AGREEMENT}}
+                "graduation": {"min_samples": st.min_samples,
+                               "min_agreement": st.min_agreement,
+                               "defaults": {
+                                   "min_samples":
+                                       _rec().GRADUATION_MIN_SAMPLES,
+                                   "min_agreement":
+                                       _rec().GRADUATION_MIN_AGREEMENT},
+                               "floors": {
+                                   "min_samples":
+                                       _rec().GRADUATION_FLOOR_SAMPLES,
+                                   "min_agreement":
+                                       _rec().GRADUATION_FLOOR_AGREEMENT}}}
 
     def _rows(self, rows, q, fields=None):
         limit = int((q.get("limit") or ["50"])[0])

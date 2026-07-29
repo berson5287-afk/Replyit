@@ -102,8 +102,32 @@ whatever the category turns out to be.
 
 ## Graduation and auto-send
 
-A category graduates at **≥50 decided samples and ≥95% unchanged**. The Stats
-window shows the numbers; double-click a row to force a manual override.
+A category graduates at **≥50 decided samples and ≥95% unchanged** by default.
+The Stats window shows the numbers; double-click a row to force a manual
+override.
+
+Both numbers are editable in **Settings → Auto-send → Graduation bar**, because
+50 at 95% is a judgement call rather than a law: it suits a high-volume
+category and is unreachable for a rare one, and the person carrying the risk of
+a wrong reply is the one who should set the bar. Floors of **1 sample and 50%
+agreement** hold whatever is entered — an agreement bar of zero would mean
+"graduate a category you have never once agreed with", which is not a threshold
+at all. A value above 1 is read as a percentage, so 95 and 0.95 both work.
+
+The settings panel previews the consequence rather than just taking a number,
+because a threshold on its own tells you nothing and the real question is which
+reply types are about to become sendable:
+
+> At this bar these would graduate now: Acknowledgement, Quote delivered
+
+Lowering the bar never bypasses the other gates. A graduated category still has
+to be ticked in Settings, sit outside `escalate`/`no_reply`, clear the
+confidence threshold, hold a draft, and not be flagged `needs_input`.
+
+Note that **deleting counts as agreement**, not disagreement — `deleted` is in
+`UNCHANGED_ACTIONS`. Binning a row says the category was not wrong, only that
+no reply was wanted; recategorising is the action that says the classifier
+missed.
 
 Auto-send fires only when every gate passes:
 
@@ -367,6 +391,7 @@ one test reply to yourself — before trusting them.
 
 | Version | Change |
 |---|---|
+| 1.20.0 | Configurable graduation bar with a live preview of what it would release; timeouts no longer cool an endpoint like a crash |
 | 1.19.0 | Auto-Send tab with live countdown; per-category auto-send opt-in; hold window in minutes; timed auto-refresh |
 | 1.18.0 | Templates rewritten to the user's measured voice; `VOICE_PROFILE` applied to every polish; invented-commitment guard; role addresses get no first name |
 | 1.17.0 | Endpoint cooldown so a broken host costs one call, not every call; settings survive a BOM and are quarantined rather than overwritten |

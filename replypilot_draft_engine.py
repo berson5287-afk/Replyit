@@ -55,6 +55,10 @@ DEFAULT_SETTINGS = {
     # long can never stack another on top of itself.
     "auto_refresh_enabled": True,
     "auto_refresh_sec": 90,
+    # v1.12.0: the graduation bar. Defaults match the original constants, so
+    # an existing install is unchanged. Floors are enforced in RecordStore.
+    "graduation_min_samples": 50,
+    "graduation_min_agreement": 0.95,
     # v1.6.0: let Outlook attach the real signature (with images) on send
     "use_outlook_signature": True,
 }

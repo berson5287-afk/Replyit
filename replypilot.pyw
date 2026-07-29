@@ -556,6 +556,10 @@ class ReplyPilotApp:
         # v1.5.0: push saved AI settings into the engine config before any
         # classification runs (env vars are the fallback defaults)
         clf.apply_ai_settings(self.settings)
+        # v1.15.0: and the graduation bar, before anything reads a stat
+        self.store.set_graduation(
+            self.settings.get("graduation_min_samples"),
+            self.settings.get("graduation_min_agreement"))
         # v1.5.0: restore last window size/position, else sane default
         root.geometry(self._restore_geometry())
         self.ui_queue = _queue.Queue()
@@ -1945,8 +1949,8 @@ class ReplyPilotApp:
         tk.Label(fc, text="Ticking narrows what may send — it does not "
                  "unlock anything. A ticked type still has to graduate "
                  "(%d samples at %d%% agreement) or be overridden in Stats."
-                 % (rec.GRADUATION_MIN_SAMPLES,
-                    round(100 * rec.GRADUATION_MIN_AGREEMENT)),
+                 % (self.store.min_samples,
+                    round(100 * self.store.min_agreement)),
                  bg=_BG, fg=_FG_DIM, font=(_FONT, _FONT_SZ),
                  justify="left", wraplength=520).pack(anchor="w",
                                                       pady=(0, 6))
@@ -1964,6 +1968,63 @@ class ReplyPilotApp:
                                              sticky="w", padx=(0, 18))
         tk.Label(fc, text="Escalate and No-Reply are never auto-sent, "
                  "regardless of settings, so they are not listed.",
+                 bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(6, 0))
+
+        # ---- graduation bar ----------------------------------------------
+        fg = ttk.LabelFrame(t1, text="Graduation bar", padding=8)
+        fg.pack(fill="x", padx=10, pady=(0, 10))
+        tk.Label(fg, text="How much evidence a reply type needs before it may "
+                 "auto-send. Lowering this does not bypass the other gates.",
+                 bg=_BG, fg=_FG_DIM, font=(_FONT, _FONT_SZ),
+                 justify="left", wraplength=520).pack(anchor="w",
+                                                      pady=(0, 6))
+        rowg = tk.Frame(fg, bg=_BG); rowg.pack(fill="x")
+        tk.Label(rowg, text="Decided samples:", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        grad_n_var = tk.StringVar(
+            value=str(self.settings.get("graduation_min_samples",
+                                        rec.GRADUATION_MIN_SAMPLES)))
+        _entry(rowg, grad_n_var, 6).pack(side="left", padx=6)
+        tk.Label(rowg, text="   Agreement (0.0–1.0):", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        grad_a_var = tk.StringVar(
+            value=str(self.settings.get("graduation_min_agreement",
+                                        rec.GRADUATION_MIN_AGREEMENT)))
+        _entry(rowg, grad_a_var, 6).pack(side="left", padx=6)
+
+        grad_preview = tk.StringVar(value="")
+        tk.Label(fg, textvariable=grad_preview, bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ), justify="left",
+                 wraplength=520).pack(anchor="w", pady=(6, 0))
+
+        def _refresh_grad_preview(*_a):
+            """Say which types the proposed bar would actually release.
+
+            A threshold on its own means nothing to anyone; the question being
+            asked is 'what starts sending if I do this', so answer that.
+            """
+            try:
+                cats = self.store.graduation_preview(grad_n_var.get(),
+                                                     grad_a_var.get())
+            except Exception:
+                grad_preview.set("")
+                return
+            sendable = [c for c in cats if c not in auto.NEVER_AUTO]
+            if not sendable:
+                grad_preview.set("At this bar, no reply type would graduate "
+                                 "yet.")
+            else:
+                grad_preview.set(
+                    "At this bar these would graduate now: %s"
+                    % ", ".join(CATEGORY_LABELS.get(c, c) for c in sendable))
+
+        grad_n_var.trace_add("write", _refresh_grad_preview)
+        grad_a_var.trace_add("write", _refresh_grad_preview)
+        _refresh_grad_preview()
+        tk.Label(fg, text="Floors of %d sample and %.0f%% agreement apply "
+                 "whatever is entered." % (rec.GRADUATION_FLOOR_SAMPLES,
+                                           100 * rec.GRADUATION_FLOOR_AGREEMENT),
                  bg=_BG, fg=_FG_DIM,
                  font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(6, 0))
 
@@ -2489,6 +2550,12 @@ class ReplyPilotApp:
             self.settings["auto_send_min_conf"] = conf
             self.settings["auto_refresh_enabled"] = refresh_on_var.get()
             self.settings["auto_refresh_sec"] = refresh
+            # graduation bar — store the CLAMPED values, so what is saved is
+            # what is actually in force rather than what was typed
+            gn, ga = self.store.set_graduation(grad_n_var.get(),
+                                               grad_a_var.get())
+            self.settings["graduation_min_samples"] = gn
+            self.settings["graduation_min_agreement"] = ga
             # None (no restriction) only survives while every box is ticked;
             # once the user unticks one this becomes an explicit list
             _picked = [c for c, v in cat_vars.items() if v.get()]
@@ -2557,8 +2624,8 @@ class ReplyPilotApp:
         tree.pack(fill="both", expand=True, padx=8, pady=8)
         note = ("Graduation: >= %d decided samples and >= %.0f%% unchanged. "
                 "Double-click a row to toggle a manual auto-send override."
-                % (rec.GRADUATION_MIN_SAMPLES,
-                   100 * rec.GRADUATION_MIN_AGREEMENT))
+                % (self.store.min_samples,
+                   100 * self.store.min_agreement))
         tk.Label(win, text=note, wraplength=640, bg=_BG, fg=_FG_DIM,
                  font=(_FONT, _FONT_SZ), justify="left",
                  pady=4, padx=8).pack(fill="x")
