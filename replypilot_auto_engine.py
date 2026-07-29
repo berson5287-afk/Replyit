@@ -26,6 +26,7 @@ ENGINE_VERSION = "1.3.0"  # v1.3.0: releases dripped one at a time rather
                           # v1.1.0: needs_input is a hard auto-send block
 
 import time
+import datetime
 
 import replypilot_classify_engine as clf
 import replypilot_record_engine as rec
@@ -35,6 +36,33 @@ NEVER_AUTO = (clf.CAT_ESCALATE, clf.CAT_NO_REPLY)
 
 # The undo window never closes completely, even with the delay switched off.
 MIN_DELAY_SEC = 5
+
+# v1.4.0: office hours. Defaults measured from the user's own sent mail — 44
+# items spanning 07:00 to 16:00 with a small evening cluster at 21:00, and
+# ZERO on a Saturday or Sunday. So Mon-Fri 07:00-17:00 covers 41 of the 44,
+# and the three it excludes are 9pm sends nobody wants a robot making.
+#
+# This gates ELIGIBILITY, not just firing, so nothing is queued out of hours
+# either. A reply held past closing simply waits: its gates are re-checked at
+# fire time, it stays listed on the Auto-Send tab, and it goes out when the
+# next working day opens rather than at 2am.
+OFFICE_DEFAULT_START = "07:00"
+OFFICE_DEFAULT_END = "17:00"
+OFFICE_DEFAULT_DAYS = (0, 1, 2, 3, 4)      # Mon-Fri, Monday == 0
+
+
+def _parse_hm(value, fallback):
+    """"HH:MM" (or "H", or "7.5") -> (hour, minute), tolerant of rubbish."""
+    s = str(value if value is not None else "").strip()
+    if not s:
+        return fallback
+    try:
+        if ":" in s:
+            h, m = s.split(":", 1)
+            return (max(0, min(23, int(h))), max(0, min(59, int(m))))
+        return (max(0, min(23, int(float(s)))), 0)
+    except (TypeError, ValueError):
+        return fallback
 
 # v1.3.0: releases are dripped, one per interval, never swept.
 #
@@ -92,6 +120,42 @@ class AutoSendEngine:
     def delay_enabled(self):
         return bool(self.settings.get("auto_send_delay_enabled", True))
 
+    def office_hours_enabled(self):
+        return bool(self.settings.get("office_hours_enabled", True))
+
+    def office_window(self):
+        """(start, end, days) actually in force."""
+        start = _parse_hm(self.settings.get("office_hours_start"),
+                          _parse_hm(OFFICE_DEFAULT_START, (7, 0)))
+        end = _parse_hm(self.settings.get("office_hours_end"),
+                        _parse_hm(OFFICE_DEFAULT_END, (17, 0)))
+        days = self.settings.get("office_hours_days")
+        if not days:
+            days = OFFICE_DEFAULT_DAYS
+        try:
+            days = {int(d) for d in days}
+        except (TypeError, ValueError):
+            days = set(OFFICE_DEFAULT_DAYS)
+        return start, end, days
+
+    def within_office_hours(self, now=None):
+        """True when auto-send is allowed to act right now.
+
+        Off means always allowed — the switch exists so a week away can be
+        handled by turning the whole feature off rather than editing hours.
+        """
+        if not self.office_hours_enabled():
+            return True
+        now = now if now is not None else datetime.datetime.now()
+        start, end, days = self.office_window()
+        if now.weekday() not in days:
+            return False
+        cur = (now.hour, now.minute)
+        if start <= end:
+            return start <= cur < end
+        # a window written backwards spans midnight (e.g. 22:00-06:00)
+        return cur >= start or cur < end
+
     def drip_enabled(self):
         return bool(self.settings.get("auto_send_drip_enabled", True))
 
@@ -142,6 +206,10 @@ class AutoSendEngine:
     def eligible_rows(self):
         """All currently pending rows that pass every gate."""
         if not self.master_on():
+            return []
+        if not self.within_office_hours():
+            # gated here rather than only in due(), so nothing is queued out
+            # of hours either — a reply already waiting simply stays waiting
             return []
         stats = self.store.category_stats()
         min_conf = self.min_conf()

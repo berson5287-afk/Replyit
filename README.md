@@ -180,6 +180,29 @@ does not mean zero — `MIN_DELAY_SEC` still applies. Every gate is re-checked a
 the moment of firing, and removing the window entirely would remove the only
 chance to stop a wrong reply.
 
+### Office hours
+
+Auto-send only acts inside a configured window — **Mon–Fri 07:00–17:00** by
+default, editable in **Settings → Auto-send → Office hours**. Those defaults are
+measured, not guessed: across 44 sent items the user's own mail spans 07:00 to
+16:00 with a small cluster at 21:00, and **not one weekend send**. Mon–Fri
+07:00–17:00 covers 41 of the 44, and the three it excludes are 9pm sends nobody
+wants a robot making.
+
+Switching the feature **off** means send at any hour. That is the holiday
+switch: going away is handled by turning it off rather than editing the window
+to nothing.
+
+This gates **eligibility**, not just firing, so nothing is queued out of hours
+either. A reply held past closing simply waits — it stays listed on the
+Auto-Send tab and goes out when the window reopens, not at 2am. A window written
+backwards (`22:00`–`06:00`) spans midnight.
+
+The settings panel states the answer outright — *"Right now: auto-send is OPEN"*
+or *"CLOSED by office hours"* — and the status bar says so too when replies are
+being held. Every other gate in this app has caught the user out by blocking
+silently; this one is not allowed to.
+
 ### The drip
 
 The hold decides **when** a reply may go. The drip decides **how fast** replies

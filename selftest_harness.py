@@ -300,6 +300,9 @@ check("decided draft unchanged", store.get(mid_rev)["ai_draft"] == "tailored aga
 # ---- 13. v1.2.0: auto-send engine gates -------------------------------------
 import replypilot_auto_engine as auto
 auto_settings = dict(settings)
+# office hours off: these cases are about the other gates, and leaving it
+# on made them depend on what time the suite happened to run
+auto_settings["office_hours_enabled"] = False
 eng = auto.AutoSendEngine(store, auto_settings)
 # gate 1: master off -> nothing, even though quote_ack graduated earlier
 store.set_auto_send_override(clf.CAT_QUOTE_ACK, True)  # re-enable from sec.5
@@ -1271,7 +1274,7 @@ check("set_needs_input unflags a row", _nis.get("<ni2@t>")["needs_input"] == 0)
 _nis.set_needs_input("<ni2@t>", True)
 _nis.set_auto_send_override(clf.CAT_QUOTE_ACK, True)
 _nia = {"auto_send_master": True, "auto_send_delay_sec": 60,
-        "auto_send_min_conf": 0.5}
+        "auto_send_min_conf": 0.5, "office_hours_enabled": False}
 _nieng = auto.AutoSendEngine(_nis, _nia)
 _elig = [r["message_id"] for r in _nieng.eligible_rows()]
 check("needs_input row is NOT auto-send eligible", "<ni2@t>" not in _elig, _elig)
@@ -1321,6 +1324,33 @@ check("Auto-Send leads: what is about to leave is seen first",
 check("countdown formats seconds under a minute", _app._fmt_countdown(45) == "45s")
 check("countdown formats minutes:seconds", _app._fmt_countdown(125) == "2:05")
 check("countdown says due at zero, not sending", _app._fmt_countdown(0) == "due")
+# office hours: gates eligibility, not just firing
+_MON = lambda h, m=0: _dt0.datetime(2026, 7, 27, h, m)   # a Monday
+_SAT = lambda h: _dt0.datetime(2026, 8, 1, h, 0)         # a Saturday
+import datetime as _dt0
+
+
+class _OhStore:
+    def pending(self): return []
+    def category_stats(self): return {}
+    def get(self, m): return None
+
+
+_oh = lambda **kw: auto.AutoSendEngine(_OhStore(), dict({"auto_send_master": True}, **kw))
+check("office hours: 09:00 Mon is open", _oh().within_office_hours(_MON(9)))
+check("office hours: 06:59 Mon is closed", not _oh().within_office_hours(_MON(6, 59)))
+check("office hours: 17:00 Mon is closed", not _oh().within_office_hours(_MON(17)))
+check("office hours: Saturday is closed all day",
+      not any(_oh().within_office_hours(_SAT(h)) for h in range(24)))
+check("office hours off = always open (the holiday switch)",
+      _oh(office_hours_enabled=False).within_office_hours(_dt0.datetime(2026, 8, 2, 3, 0)))
+check("office hours: a window written backwards spans midnight",
+      _oh(office_hours_start="22:00", office_hours_end="06:00").within_office_hours(_MON(2)))
+check("office hours: rubbish falls back instead of raising",
+      all(_oh(office_hours_start=_b).within_office_hours(_MON(9)) is not None
+          for _b in ("", "abc", None, "99:99")))
+check("office hours: empty day list falls back to Mon-Fri",
+      _oh(office_hours_days=[]).within_office_hours(_MON(9)))
 # greeting: two halves split at noon, and the model cannot move it
 import datetime as _dt
 _gr = lambda h: drafts.greeting_for("Roger", "r@x.com", now=_dt.datetime(2026, 7, 29, h, 0))
@@ -1517,7 +1547,8 @@ class _DiagApp:
         self.settings = {"signature": settings["signature"],
                          "auto_send_master": False,
                          "auto_send_delay_sec": 60,
-                         "auto_send_min_conf": 0.85}
+                         "auto_send_min_conf": 0.85,
+                         "office_hours_enabled": False}
         self.busy = False; self.ai_queue = {}
         self.auto = auto.AutoSendEngine(_bstore2, self.settings)
         self.learn = le.LearningStore(_bstore2)

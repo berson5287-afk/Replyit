@@ -1414,7 +1414,13 @@ class ReplyPilotApp:
             # cancelled, and flashing at that would be noise
             if prev is not None and n > prev:
                 self._flash_autosend()
-        if n:
+        if n and not self.auto.within_office_hours():
+            st, en, _d = self.auto.office_window()
+            self._set_status(
+                "%d auto-send(s) held — outside office hours (%02d:%02d–"
+                "%02d:%02d). They go out when the window reopens."
+                % (n, st[0], st[1], en[0], en[1]))
+        elif n:
             secs = self.auto.next_fire_in()
             drip = self.auto.next_drip_in()
             # report whichever gate is actually holding the next send, so the
@@ -2077,6 +2083,73 @@ class ReplyPilotApp:
                  bg=_BG, fg=_FG_DIM,
                  font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(6, 0))
 
+        # ---- office hours ------------------------------------------------
+        fo = ttk.LabelFrame(t1, text="Office hours", padding=8)
+        fo.pack(fill="x", padx=10, pady=(0, 10))
+        office_on_var = tk.BooleanVar(
+            value=bool(self.settings.get("office_hours_enabled", True)))
+        ttk.Checkbutton(fo, text="Only auto-send during office hours",
+                        variable=office_on_var).pack(anchor="w")
+        tk.Label(fo, text="Off = send at any hour. Turn it off for a holiday "
+                 "rather than editing the window.", bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(0, 6))
+        rowo = tk.Frame(fo, bg=_BG); rowo.pack(fill="x")
+        tk.Label(rowo, text="       From", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        office_start_var = tk.StringVar(
+            value=str(self.settings.get("office_hours_start", "07:00")))
+        _entry(rowo, office_start_var, 7).pack(side="left", padx=6)
+        tk.Label(rowo, text="to", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        office_end_var = tk.StringVar(
+            value=str(self.settings.get("office_hours_end", "17:00")))
+        _entry(rowo, office_end_var, 7).pack(side="left", padx=6)
+        tk.Label(rowo, text="(24h, HH:MM)", bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        rowd2 = tk.Frame(fo, bg=_BG); rowd2.pack(fill="x", pady=(6, 0))
+        tk.Label(rowd2, text="       Days", bg=_BG, fg=_FG,
+                 font=(_FONT, _FONT_SZ)).pack(side="left")
+        _saved_days = self.settings.get("office_hours_days")
+        if not _saved_days:
+            _saved_days = list(auto.OFFICE_DEFAULT_DAYS)
+        day_vars = {}
+        for _i, _nm in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri",
+                                  "Sat", "Sun")):
+            _v = tk.BooleanVar(value=_i in set(_saved_days))
+            day_vars[_i] = _v
+            ttk.Checkbutton(rowd2, text=_nm, variable=_v).pack(side="left",
+                                                               padx=(6, 0))
+        office_now = tk.StringVar(value="")
+        tk.Label(fo, textvariable=office_now, bg=_BG, fg=_FG_DIM,
+                 font=(_FONT, _FONT_SZ)).pack(anchor="w", pady=(6, 0))
+
+        def _refresh_office_now(*_a):
+            """Say plainly whether sending is open right now.
+
+            Every other gate in this app has caught the user out by blocking
+            silently, so this one states its own answer rather than leaving it
+            to be deduced from an empty queue.
+            """
+            probe = dict(self.settings)
+            probe["office_hours_enabled"] = office_on_var.get()
+            probe["office_hours_start"] = office_start_var.get()
+            probe["office_hours_end"] = office_end_var.get()
+            probe["office_hours_days"] = [d for d, v in day_vars.items()
+                                          if v.get()]
+            try:
+                ok = auto.AutoSendEngine(self.store, probe).within_office_hours()
+            except Exception:
+                office_now.set("")
+                return
+            office_now.set("Right now: auto-send is %s."
+                           % ("OPEN" if ok else "CLOSED by office hours"))
+
+        for _v in (office_on_var, office_start_var, office_end_var):
+            _v.trace_add("write", _refresh_office_now)
+        for _v in day_vars.values():
+            _v.trace_add("write", _refresh_office_now)
+        _refresh_office_now()
+
         # ---- graduation bar ----------------------------------------------
         fg = ttk.LabelFrame(t1, text="Graduation bar", padding=8)
         fg.pack(fill="x", padx=10, pady=(0, 10))
@@ -2661,6 +2734,11 @@ class ReplyPilotApp:
             self.settings["auto_refresh_sec"] = refresh
             self.settings["auto_send_drip_enabled"] = drip_on_var.get()
             self.settings["auto_send_drip_sec"] = drip
+            self.settings["office_hours_enabled"] = office_on_var.get()
+            self.settings["office_hours_start"] = office_start_var.get().strip()
+            self.settings["office_hours_end"] = office_end_var.get().strip()
+            self.settings["office_hours_days"] = sorted(
+                d for d, v in day_vars.items() if v.get())
             # graduation bar — store the CLAMPED values, so what is saved is
             # what is actually in force rather than what was typed
             gn, ga = self.store.set_graduation(grad_n_var.get(),

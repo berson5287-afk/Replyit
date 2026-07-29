@@ -458,7 +458,14 @@ class DiagBridge:
         if eng is None:
             return {"error": "auto engine not attached"}
         elig = eng.eligible_rows()
-        return {"master_on": eng.master_on(),
+        st, en, days = eng.office_window()
+        return {"office_hours": {
+                    "enabled": eng.office_hours_enabled(),
+                    "window": "%02d:%02d-%02d:%02d" % (st[0], st[1],
+                                                       en[0], en[1]),
+                    "days": sorted(days),
+                    "open_now": eng.within_office_hours()},
+                "master_on": eng.master_on(),
                 "delay_sec": eng.delay_sec(),
                 "min_conf": eng.min_conf(),
                 "never_auto": list(_auto().NEVER_AUTO),

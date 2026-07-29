@@ -74,6 +74,13 @@ DEFAULT_SETTINGS = {
     # backlog cannot leave in a single burst. See AutoSendEngine.due().
     "auto_send_drip_enabled": True,
     "auto_send_drip_sec": 60,
+    # v1.14.0: office hours. Defaults measured from the user's own sent mail:
+    # 07:00-16:00 with zero weekend sends across 44 items. Turning the feature
+    # off is the vacation switch — no need to edit the window.
+    "office_hours_enabled": True,
+    "office_hours_start": "07:00",
+    "office_hours_end": "17:00",
+    "office_hours_days": [0, 1, 2, 3, 4],   # Monday == 0
     # v1.6.0: let Outlook attach the real signature (with images) on send
     "use_outlook_signature": True,
 }
