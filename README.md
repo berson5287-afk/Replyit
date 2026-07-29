@@ -155,6 +155,18 @@ Everything scheduled to send waits on the first tab, with a live countdown, so
 what is about to leave the building is the first thing visible rather than
 something you go looking for. Opening or deleting a row cancels its send.
 
+Double-click a queued row to read and edit it, exactly as on any other tab — a
+reply about to go out unattended is the one most worth being able to change
+first. Opening **cancels the scheduled send before the window appears**, which
+is the only safe order: editing a draft while its countdown runs would race the
+send, and the row could leave mid-edit.
+
+Closing that window without deciding does not delete anything. The row is still
+pending and still eligible, so the next scan re-queues it — with a **fresh full
+hold**, not the remainder of the old one. Reviewing therefore buys back the
+whole undo window every time. To stop it going out at all, decide it: Accept,
+Decline, Delete, or Move to No Reply.
+
 The hold is set in minutes (**Settings → Auto-send**), because a window you
 would actually use to catch a bad reply is minutes long. Switching the hold off
 does not mean zero — `MIN_DELAY_SEC` still applies. Every gate is re-checked at

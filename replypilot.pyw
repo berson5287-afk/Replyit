@@ -678,6 +678,13 @@ class ReplyPilotApp:
         self.nb.add(self.tree_done.master,     text="Decided (0)")
 
         # double-click → review
+        # Auto-Send included deliberately: a reply you are about to send is
+        # the one most worth being able to read and edit first. _open_review
+        # cancels the scheduled send before opening, which is the only safe
+        # order — editing a draft while its countdown runs would race the
+        # send, and the row would leave mid-edit.
+        self.tree_autosend.bind("<Double-1>",
+            lambda e: self._open_review(self.tree_autosend))
         self.tree_queue.bind("<Double-1>",
             lambda e: self._open_review(self.tree_queue))
         self.tree_input.bind("<Double-1>",
