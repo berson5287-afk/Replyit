@@ -1079,13 +1079,19 @@ class ReplyPilotApp:
                 recorded += 1
                 continue
             if regen:
-                # recategorized — regenerate the draft for the new category
-                # rather than sending text written for the old one
-                draft, _src = drafts.make_draft(
+                # Recategorized — regenerate the draft for the new category
+                # rather than sending text written for the old one.
+                #
+                # Template only, deliberately. make_draft() here meant one LLM
+                # round trip PER ROW on the Tk thread, so bulk-recategorizing
+                # twenty emails froze the app for minutes. Nobody reads twenty
+                # drafts during a bulk action, and the templates are already in
+                # the user's measured voice, so polishing them costs a freeze
+                # to improve text no one is looking at. Opening any row still
+                # polishes it, off the UI thread.
+                draft = drafts.render_template(
                     cat, row.get("sender", "").split("@")[0],
-                    row.get("sender", ""), row.get("subject", ""),
-                    row.get("body_full") or "", self.settings,
-                    voice_examples=self._voice_for(cat))
+                    row.get("sender", ""), self.settings)
             else:
                 draft = row.get("ai_draft") or ""
             self.auto.cancel(mid)
@@ -2891,20 +2897,68 @@ class ReviewWindow:
                          padx=8, pady=3, bd=0)
 
     # ------------------------------------------------------------- callbacks
+    def _set_draft(self, text):
+        self.draft_txt.delete("1.0", "end")
+        self.draft_txt.insert("1.0", text or "")
+
     def _on_category_change(self):
+        """Show the template at once, then polish off the UI thread.
+
+        make_draft() was called inline here, and with polish on that is a full
+        LLM round trip — 4-10s warm, and far worse on a cold model load or
+        while a dead endpoint is retried. Tk has one thread, so the whole app
+        froze for the duration every time a response type was picked.
+
+        The template is deterministic and instant, so it lands immediately and
+        the window stays usable; the polished version replaces it when it
+        arrives. A generation counter discards a result whose category has
+        since been changed again — otherwise a slow polish for the previous
+        choice would overwrite the new one seconds later.
+        """
         cat = self.cat_var.get()
         if cat == clf.CAT_NO_REPLY:
             self.draft_txt.delete("1.0", "end")
             return
         name = self.row.get("sender", "").split("@")[0]
-        text, _src = drafts.make_draft(
-            cat, name, self.row.get("sender", ""),
-            self.row.get("subject", ""),
-            self.row.get("body_full") or "",
-            self.app.settings,
-            voice_examples=self.app._voice_for(cat))
-        self.draft_txt.delete("1.0", "end")
-        self.draft_txt.insert("1.0", text)
+
+        base = drafts.render_template(cat, name, self.row.get("sender", ""),
+                                      self.app.settings)
+        self._set_draft(base)
+
+        if not (self.app.settings or {}).get("use_llm_polish"):
+            return
+
+        self._draft_gen = getattr(self, "_draft_gen", 0) + 1
+        gen = self._draft_gen
+        # read the corpus on THIS thread: cheap, and it keeps the worker to
+        # the one slow thing it is there for
+        voice = self.app._voice_for(cat)
+        self.app._set_status("Tailoring the draft…")
+
+        def work():
+            try:
+                text, _src = drafts.make_draft(
+                    cat, name, self.row.get("sender", ""),
+                    self.row.get("subject", ""),
+                    self.row.get("body_full") or "",
+                    self.app.settings, voice_examples=voice)
+            except Exception:
+                text = None
+
+            def apply():
+                if gen != getattr(self, "_draft_gen", gen):
+                    return              # the user has since picked another
+                if text and text.strip() and text != base:
+                    self._set_draft(text)
+                self.app._set_status("Draft tailored." if text
+                                     else "Draft kept as the template.")
+            try:
+                # marshal back to the UI thread; raises if the window is gone
+                self.win.after(0, apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _final_state(self):
         cat = self.cat_var.get()
@@ -2955,14 +3009,15 @@ class ReviewWindow:
         self._close("Moved to No Reply.")
 
     def undo_no_reply(self):
+        # Template only: this restores the row to the queue and closes the
+        # window immediately, so an LLM call here would freeze the app on the
+        # way out for a draft the user is about to be shown in the queue
+        # anyway. Opening it there polishes it, off the UI thread.
         name = self.row.get("sender", "").split("@")[0]
-        text, _src = drafts.make_draft(
+        text = drafts.render_template(
             clf.CAT_QUOTE_ACK, name,
             self.row.get("sender", ""),
-            self.row.get("subject", ""),
-            self.row.get("body_full") or "",
-            self.app.settings,
-            voice_examples=self.app._voice_for(clf.CAT_QUOTE_ACK))
+            self.app.settings)
         self.app.store.reopen(
             self.row["message_id"],
             new_ai_category=clf.CAT_QUOTE_ACK,
