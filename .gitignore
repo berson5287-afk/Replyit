@@ -34,3 +34,6 @@ desktop.ini
 
 # working notes, not portfolio material
 SESSION_NOTES.md
+
+# another tool's local backups, not part of the project
+.aichatlab/
